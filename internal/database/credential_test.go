@@ -203,6 +203,47 @@ func TestFetchGitHubOIDCToken_MalformedJSON(t *testing.T) {
 	}
 }
 
+// New tests added to validate explicit-argument enablement and separation of token resolution from enablement.
+func TestBuildEntraCredential_OIDC_EnabledByArgument(t *testing.T) {
+	clearOIDCEnv(t)
+
+	// Ensure tenant and client IDs are available; BuildEntraCredential will use
+	// the environment values when empty strings are passed for tenant/client.
+	t.Setenv("ARM_TENANT_ID", "00000000-0000-0000-0000-000000000000")
+	t.Setenv("ARM_CLIENT_ID", "11111111-1111-1111-1111-111111111111")
+
+	// Call BuildEntraCredential with explicit useOIDC=true (first optional arg)
+	// and an explicit token (second optional arg). This should select the OIDC path.
+	cred, err := BuildEntraCredential("", "", "", true, "dummy-argument-jwt")
+	if err != nil {
+		t.Fatalf("BuildEntraCredential with explicit useOIDC and token failed: %v", err)
+	}
+	if cred == nil {
+		t.Fatal("credential is nil")
+	}
+}
+
+func TestBuildEntraCredential_ExplicitTokenDoesNotEnableOIDC(t *testing.T) {
+	clearOIDCEnv(t)
+
+	// Supply a token in the environment but do NOT enable ARM_USE_OIDC.
+	t.Setenv("ARM_OIDC_TOKEN", "dummy-env-jwt")
+	t.Setenv("ARM_USE_OIDC", "")
+
+	// Calling BuildEntraCredential without enabling OIDC should not silently
+	// start OIDC auth. Because no explicit client credentials are provided and
+	// the ambient chain is not guaranteed in test environments, we expect an
+	// error describing the lack of an available Entra credential source rather
+	// than an OIDC-specific error.
+	_, err := BuildEntraCredential("", "", "")
+	if err == nil {
+		t.Fatal("expected error when OIDC not enabled but no ambient credential available")
+	}
+	if !strings.Contains(err.Error(), "no Entra credential source available") {
+		t.Fatalf("unexpected error message (expected ambient-credential error), got: %v", err)
+	}
+}
+
 // clearOIDCEnv unsets every env var BuildEntraCredential consults so each test
 // starts from a known state. t.Setenv restores prior values at cleanup.
 func clearOIDCEnv(t *testing.T) {
