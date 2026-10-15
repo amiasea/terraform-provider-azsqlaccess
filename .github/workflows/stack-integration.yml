@@ -368,6 +368,47 @@ jobs:
           echo "Configuration uploaded: ${configuration_id}"
           echo "configuration_id=${configuration_id}" >> "$GITHUB_OUTPUT"
 
+      - name: Diagnose Stack configuration
+        if: always()
+        shell: bash
+        env:
+          TFC_API: https://app.terraform.io/api/v2
+          CONFIGURATION_ID: ${{ steps.upload.outputs.configuration_id }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${CONFIGURATION_ID:-}" ]]; then
+            echo "No configuration ID available; upload may have failed."
+            exit 0
+          fi
+
+          api() {
+            curl --fail-with-body --silent --show-error \
+              --header "Authorization: Bearer ${TF_TOKEN_app_terraform_io}" \
+              --header "Content-Type: application/vnd.api+json" \
+              "$@"
+          }
+
+          echo "=== Configuration details ==="
+          api "${TFC_API}/stack-configurations/${CONFIGURATION_ID}" |
+            jq '.data | {
+              id,
+              attributes: {
+                status: .attributes.status,
+                sequence_number: .attributes["sequence-number"],
+                updated_at: .attributes["updated-at"],
+                components: .attributes.components
+              }
+            }'
+
+          echo "=== Configuration diagnostics ==="
+          api "${TFC_API}/stack-configurations/${CONFIGURATION_ID}/stack-diagnostics" |
+            jq '.data[]? | {
+              severity: .attributes.severity,
+              summary: .attributes.summary,
+              detail: .attributes.detail
+            }'
+
       - name: Poll Stack configuration and deployment
         shell: bash
         env:
