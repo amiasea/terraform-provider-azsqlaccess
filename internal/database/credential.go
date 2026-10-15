@@ -26,20 +26,56 @@ const oidcExchangeAudience = "api://AzureADTokenExchange"
 const oidcFetchTimeout = 30 * time.Second
 
 // BuildEntraCredential constructs the Entra credential the provider uses for
-// Azure SQL and Postgres Flexible Server, with precedence matching
-// azurerm/azuread/azapi so pipelines wired for those providers work unchanged:
+// Azure SQL and Postgres Flexible Server, with precedence matching the common
+// Azure provider contract:
 //
 //  1. Explicit service principal: tenant_id + client_id + client_secret.
-//  2. GitHub Actions OIDC: ARM_USE_OIDC=true plus ACTIONS_ID_TOKEN_REQUEST_URL/TOKEN.
-//  3. Explicit federated assertion: ARM_USE_OIDC=true plus ARM_OIDC_TOKEN or
-//     ARM_OIDC_TOKEN_FILE_PATH (for non-GitHub CIs).
-//  4. Ambient fallback chain: Azure CLI → workload identity → managed identity.
+//  2. OIDC auth when enabled via ARM_USE_OIDC or use_oidc=true.
+//  3. Ambient fallback chain: Azure CLI → workload identity → managed identity.
 //
-// (4) is an explicit ChainedTokenCredential, not DefaultAzureCredential. DAC
-// transparently extends to interactive flows (InteractiveBrowserCredential,
-// VisualStudioCodeCredential, AzureDeveloperCLICredential) which are not
-// appropriate for a non-interactive provider and broaden the trust surface.
-func BuildEntraCredential(tenantID, clientID, clientSecret string) (azcore.TokenCredential, error) {
+// The optional arguments are kept for compatibility with the provider's explicit
+// OIDC configuration path and allow callers to override the environment-driven
+// defaults without mutating process state.
+func BuildEntraCredential(tenantID, clientID, clientSecret string, optional ...any) (azcore.TokenCredential, error) {
+	useOIDC := oidcEnabled()
+	oidcToken := os.Getenv("ARM_OIDC_TOKEN")
+	oidcTokenFilePath := os.Getenv("ARM_OIDC_TOKEN_FILE_PATH")
+	actionsIDTokenRequestURL := os.Getenv("ACTIONS_ID_TOKEN_REQUEST_URL")
+	actionsIDTokenRequestToken := os.Getenv("ACTIONS_ID_TOKEN_REQUEST_TOKEN")
+
+	for i, opt := range optional {
+		switch i {
+		case 0:
+			if v, ok := opt.(bool); ok {
+				useOIDC = v
+			}
+		case 1:
+			if v, ok := opt.(string); ok {
+				if v != "" {
+					oidcToken = v
+				}
+			}
+		case 2:
+			if v, ok := opt.(string); ok {
+				if v != "" {
+					oidcTokenFilePath = v
+				}
+			}
+		case 3:
+			if v, ok := opt.(string); ok {
+				if v != "" {
+					actionsIDTokenRequestURL = v
+				}
+			}
+		case 4:
+			if v, ok := opt.(string); ok {
+				if v != "" {
+					actionsIDTokenRequestToken = v
+				}
+			}
+		}
+	}
+
 	if tenantID != "" && clientID != "" && clientSecret != "" {
 		cred, err := azidentity.NewClientSecretCredential(tenantID, clientID, clientSecret, nil)
 		if err != nil {
@@ -48,14 +84,14 @@ func BuildEntraCredential(tenantID, clientID, clientSecret string) (azcore.Token
 		return cred, nil
 	}
 
-	if oidcEnabled() {
-		tID := firstNonEmpty(tenantID, os.Getenv("ARM_TENANT_ID"))
-		cID := firstNonEmpty(clientID, os.Getenv("ARM_CLIENT_ID"))
+	if useOIDC {
+		tID := firstNonEmpty(tenantID, os.Getenv("ARM_TENANT_ID"), os.Getenv("AZURE_TENANT_ID"))
+		cID := firstNonEmpty(clientID, os.Getenv("ARM_CLIENT_ID"), os.Getenv("AZURE_CLIENT_ID"))
 		if tID == "" || cID == "" {
 			return nil, errors.New("ARM_USE_OIDC=true but tenant_id/client_id are not set " +
 				"(supply via provider block or ARM_TENANT_ID/ARM_CLIENT_ID env vars)")
 		}
-		cred, err := newOIDCCredential(tID, cID)
+		cred, err := newOIDCCredential(tID, cID, oidcToken, oidcTokenFilePath, actionsIDTokenRequestURL, actionsIDTokenRequestToken)
 		if err != nil {
 			return nil, fmt.Errorf("OIDC credential: %w", err)
 		}
@@ -106,23 +142,18 @@ func oidcEnabled() bool {
 	}
 }
 
-// newOIDCCredential picks the assertion source based on which ARM_OIDC_* /
-// ACTIONS_ID_TOKEN_REQUEST_* env vars are populated.
-func newOIDCCredential(tenantID, clientID string) (azcore.TokenCredential, error) {
+// newOIDCCredential picks the assertion source based on the resolved OIDC inputs.
+func newOIDCCredential(tenantID, clientID, oidcToken, oidcTokenFilePath, reqURL, reqToken string) (azcore.TokenCredential, error) {
 	switch {
-	case os.Getenv("ARM_OIDC_TOKEN") != "":
-		token := os.Getenv("ARM_OIDC_TOKEN")
+	case oidcToken != "":
 		return azidentity.NewClientAssertionCredential(tenantID, clientID,
-			func(_ context.Context) (string, error) { return token, nil }, nil)
+			func(_ context.Context) (string, error) { return oidcToken, nil }, nil)
 
-	case os.Getenv("ARM_OIDC_TOKEN_FILE_PATH") != "":
-		path := os.Getenv("ARM_OIDC_TOKEN_FILE_PATH")
+	case oidcTokenFilePath != "":
 		return azidentity.NewClientAssertionCredential(tenantID, clientID,
-			func(_ context.Context) (string, error) { return readTokenFile(path) }, nil)
+			func(_ context.Context) (string, error) { return readTokenFile(oidcTokenFilePath) }, nil)
 
-	case os.Getenv("ACTIONS_ID_TOKEN_REQUEST_URL") != "" && os.Getenv("ACTIONS_ID_TOKEN_REQUEST_TOKEN") != "":
-		reqURL := os.Getenv("ACTIONS_ID_TOKEN_REQUEST_URL")
-		reqToken := os.Getenv("ACTIONS_ID_TOKEN_REQUEST_TOKEN")
+	case reqURL != "" && reqToken != "":
 		return azidentity.NewClientAssertionCredential(tenantID, clientID,
 			func(ctx context.Context) (string, error) {
 				return fetchGitHubOIDCToken(ctx, http.DefaultClient, reqURL, reqToken)
