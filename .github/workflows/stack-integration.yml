@@ -1,0 +1,461 @@
+name: Stack Integration
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/stack-integration.yml"
+      - "integration/stack/**"
+      - "dev.tfrc.json"
+      - "**/*.go"
+      - "go.mod"
+      - "go.sum"
+
+permissions:
+  contents: read
+
+env:
+  TF_TOKEN_app_terraform_io: ${{ secrets.TF_TOKEN_APP_TERRAFORM_IO }}
+  TF_CLI_CONFIG_FILE: ${{ github.workspace }}/dev.tfrc.json
+  TFC_AGENT_TOKEN: ${{ secrets.TFC_AGENT_TOKEN }}
+
+  TFC_ORGANIZATION: amiasea-development
+  TFC_PROJECT_NAME: github-actions-integration
+  TFC_STACK_NAME: azsqlaccess-integration
+  TFC_AGENT_POOL_ID: ${{ secrets.TFC_AGENT_POOL_ID }}
+  TFC_VARSET_NAME: github-actions-integration
+
+  AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+  AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+  AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+  AZURE_DATABASE_HOST: ${{ vars.AZURE_DATABASE_HOST }}
+  AZURE_DATABASE_NAME: ${{ vars.AZURE_DATABASE_NAME }}
+  DATABASE_ENGINE: ${{ vars.DATABASE_ENGINE }}
+  ENTRA_GROUP_DISPLAY_NAME: ${{ vars.ENTRA_GROUP_DISPLAY_NAME }}
+
+jobs:
+  integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    services:
+      tfc-agent:
+        image: hashicorp/tfc-agent:latest
+        env:
+          TFC_AGENT_TOKEN: ${{ secrets.TFC_AGENT_TOKEN }}
+          TF_CLI_CONFIG_FILE: /workspace/dev.tfrc.json
+          TF_TOKEN_app_terraform_io: ${{ secrets.TF_TOKEN_APP_TERRAFORM_IO }}
+        volumes:
+          - ${{ github.workspace }}:/workspace
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build provider
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+            go build -o dist/terraform-provider-azsqlaccess .
+
+      - name: Validate configuration and inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -x dist/terraform-provider-azsqlaccess
+          test -f dev.tfrc.json
+          test -f integration/stack/main.tfdeploy.hcl
+
+          : "${AZURE_TENANT_ID:?Missing repository variable AZURE_TENANT_ID}"
+          : "${AZURE_CLIENT_ID:?Missing repository variable AZURE_CLIENT_ID}"
+          : "${AZURE_SUBSCRIPTION_ID:?Missing repository variable AZURE_SUBSCRIPTION_ID}"
+          : "${AZURE_DATABASE_HOST:?Missing repository variable AZURE_DATABASE_HOST}"
+          : "${AZURE_DATABASE_NAME:?Missing repository variable AZURE_DATABASE_NAME}"
+          : "${DATABASE_ENGINE:?Missing repository variable DATABASE_ENGINE}"
+          : "${ENTRA_GROUP_DISPLAY_NAME:?Missing repository variable ENTRA_GROUP_DISPLAY_NAME}"
+
+          case "${DATABASE_ENGINE,,}" in
+            mssql|postgres|postgresql) ;;
+            *)
+              echo "::error::DATABASE_ENGINE must be mssql, postgres, or postgresql."
+              exit 1
+              ;;
+          esac
+
+      - name: Install API tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq curl
+
+      - name: Upsert HCP Terraform Project, Stack, and Variable Set
+        id: upsert
+        shell: bash
+        env:
+          TFC_API: https://app.terraform.io/api/v2
+        run: |
+          set -euo pipefail
+
+          : "${TF_TOKEN_app_terraform_io:?Missing HCP Terraform API token}"
+          : "${TFC_AGENT_POOL_ID:?Missing HCP Terraform agent pool ID}"
+
+          api() {
+            curl --fail-with-body --silent --show-error \
+              --header "Authorization: Bearer ${TF_TOKEN_app_terraform_io}" \
+              --header "Content-Type: application/vnd.api+json" \
+              "$@"
+          }
+
+          # Find or create the Project.
+          projects="$(api \
+            "${TFC_API}/organizations/${TFC_ORGANIZATION}/projects?page%5Bsize%5D=100")"
+
+          project_id="$(jq -r \
+            --arg name "$TFC_PROJECT_NAME" \
+            '[.data[] | select(.attributes.name == $name) | .id][0] // empty' \
+            <<< "$projects")"
+
+          if [[ -z "$project_id" ]]; then
+            project_payload="$(jq -n \
+              --arg name "$TFC_PROJECT_NAME" \
+              '{
+                data: {
+                  type: "projects",
+                  attributes: {
+                    name: $name,
+                    description: "GitHub Actions provider integration tests"
+                  }
+                }
+              }')"
+
+            project="$(api --request POST \
+              --data "$project_payload" \
+              "${TFC_API}/organizations/${TFC_ORGANIZATION}/projects")"
+
+            project_id="$(jq -r '.data.id' <<< "$project")"
+          fi
+
+          test -n "$project_id"
+          test "$project_id" != "null"
+          echo "Project ID: ${project_id}"
+
+          # Find the Stack in this Project.
+          stacks="$(api \
+            "${TFC_API}/organizations/${TFC_ORGANIZATION}/stacks?page%5Bsize%5D=100")"
+
+          stack_id="$(jq -r \
+            --arg name "$TFC_STACK_NAME" \
+            --arg project "$project_id" \
+            '[.data[]
+              | select(.attributes.name == $name)
+              | select(.relationships.project.data.id == $project)
+              | .id][0] // empty' <<< "$stacks")"
+
+          # Explicitly assign the Stack to the configured agent pool.
+          stack_payload="$(jq -n \
+            --arg name "$TFC_STACK_NAME" \
+            --arg project "$project_id" \
+            --arg pool "$TFC_AGENT_POOL_ID" \
+            '{
+              data: {
+                type: "stacks",
+                attributes: {
+                  name: $name,
+                  description: "Custom azsqlaccess provider integration test",
+                  "execution-mode": "agent",
+                  "setting-overwrites": {
+                    "execution-mode": true,
+                    "agent-pool": true
+                  },
+                  "trigger-disabled": false,
+                  "speculative-enabled": false
+                },
+                relationships: {
+                  project: {
+                    data: {type: "projects", id: $project}
+                  },
+                  "agent-pool": {
+                    data: {type: "agent-pools", id: $pool}
+                  }
+                }
+              }
+            }')"
+
+          if [[ -z "$stack_id" ]]; then
+            stack="$(api --request POST \
+              --data "$stack_payload" \
+              "${TFC_API}/stacks")"
+            stack_id="$(jq -r '.data.id' <<< "$stack")"
+          else
+            api --request PATCH \
+              --data "$stack_payload" \
+              "${TFC_API}/stacks/${stack_id}" >/dev/null
+          fi
+
+          test -n "$stack_id"
+          test "$stack_id" != "null"
+
+          # Find or create a variable set owned by this Project.
+          varsets="$(api \
+            "${TFC_API}/projects/${project_id}/varsets?page%5Bsize%5D=100")"
+
+          varset_id="$(jq -r \
+            --arg name "$TFC_VARSET_NAME" \
+            --arg project "$project_id" \
+            '[.data[]
+              | select(.attributes.name == $name)
+              | select(.relationships.parent.data.id == $project)
+              | .id][0] // empty' <<< "$varsets")"
+
+          if [[ -z "$varset_id" ]]; then
+            varset_payload="$(jq -n \
+              --arg name "$TFC_VARSET_NAME" \
+              --arg project "$project_id" \
+              '{
+                data: {
+                  type: "varsets",
+                  attributes: {
+                    name: $name,
+                    description: "Repository variables for provider integration tests",
+                    global: false,
+                    priority: false
+                  },
+                  relationships: {
+                    parent: {
+                      data: {type: "projects", id: $project}
+                    }
+                  }
+                }
+              }')"
+
+            varset="$(api --request POST \
+              --data "$varset_payload" \
+              "${TFC_API}/organizations/${TFC_ORGANIZATION}/varsets")"
+
+            varset_id="$(jq -r '.data.id' <<< "$varset")"
+          fi
+
+          test -n "$varset_id"
+          test "$varset_id" != "null"
+
+          # Reconcile Terraform variables with GitHub repository variables.
+          # Existing keys are updated; missing keys are added.
+          vars_response="$(api \
+            "${TFC_API}/varsets/${varset_id}/relationships/vars?page%5Bsize%5D=100")"
+
+          sync_var() {
+            local key="$1"
+            local value="$2"
+            local var_id
+            local payload
+
+            var_id="$(jq -r \
+              --arg key "$key" \
+              '[.data[] | select(.attributes.key == $key) | .id][0] // empty' \
+              <<< "$vars_response")"
+
+            payload="$(jq -n \
+              --arg key "$key" \
+              --arg value "$value" \
+              '{
+                data: {
+                  type: "vars",
+                  attributes: {
+                    key: $key,
+                    value: $value,
+                    category: "terraform",
+                    hcl: false,
+                    sensitive: false
+                  }
+                }
+              }')"
+
+            if [[ -n "$var_id" ]]; then
+              api --request PATCH \
+                --data "$payload" \
+                "${TFC_API}/varsets/${varset_id}/relationships/vars/${var_id}" \
+                >/dev/null
+              echo "Updated variable: ${key}"
+            else
+              api --request POST \
+                --data "$payload" \
+                "${TFC_API}/varsets/${varset_id}/relationships/vars" \
+                >/dev/null
+              echo "Created variable: ${key}"
+            fi
+          }
+
+          sync_var azure_tenant_id "$AZURE_TENANT_ID"
+          sync_var azure_client_id "$AZURE_CLIENT_ID"
+          sync_var azure_subscription_id "$AZURE_SUBSCRIPTION_ID"
+          sync_var azure_database_host "$AZURE_DATABASE_HOST"
+          sync_var azure_database_name "$AZURE_DATABASE_NAME"
+          sync_var database_engine "${DATABASE_ENGINE,,}"
+          sync_var entra_group_display_name "$ENTRA_GROUP_DISPLAY_NAME"
+
+          echo "Project ID: ${project_id}"
+          echo "Stack ID: ${stack_id}"
+          echo "Variable set ID: ${varset_id}"
+
+          echo "TFC_PROJECT_ID=${project_id}" >> "$GITHUB_ENV"
+          echo "TFC_STACK_ID=${stack_id}" >> "$GITHUB_ENV"
+          echo "TFC_VARSET_ID=${varset_id}" >> "$GITHUB_ENV"
+
+          stack_url="https://app.terraform.io/app/${TFC_ORGANIZATION}/stacks/${stack_id}"
+          echo "stack_url=${stack_url}" >> "$GITHUB_OUTPUT"
+          echo "Stack URL: ${stack_url}"
+
+      - name: Package Stack configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -d integration/stack
+          test -f integration/stack/main.tfdeploy.hcl
+
+          tar -czf "$RUNNER_TEMP/stack-configuration.tar.gz" \
+            -C integration/stack .
+
+      - name: Upload Stack configuration
+        id: upload
+        shell: bash
+        env:
+          TFC_API: https://app.terraform.io/api/v2
+        run: |
+          set -euo pipefail
+
+          api() {
+            curl --fail-with-body --silent --show-error \
+              --header "Authorization: Bearer ${TF_TOKEN_app_terraform_io}" \
+              --header "Content-Type: application/vnd.api+json" \
+              "$@"
+          }
+
+          # Create a non-speculative configuration version.
+          configuration="$(api --request POST \
+            --data '{"data":{"attributes":{"speculative":false}}}' \
+            "${TFC_API}/stacks/${TFC_STACK_ID}/stack-configurations?source=manual")"
+
+          configuration_id="$(jq -r '.data.id' <<< "$configuration")"
+          test -n "$configuration_id"
+          test "$configuration_id" != "null"
+
+          upload="$(api \
+            "${TFC_API}/stack-configurations/${configuration_id}/upload-url")"
+
+          upload_url="$(jq -r '.data."source-upload-url"' <<< "$upload")"
+          test -n "$upload_url"
+          test "$upload_url" != "null"
+
+          # The temporary upload URL is a bearer capability.
+          # Do not print it or send the HCP API token to this URL.
+          curl --fail-with-body --silent --show-error \
+            --request PUT \
+            --header "Content-Type: application/octet-stream" \
+            --data-binary @"$RUNNER_TEMP/stack-configuration.tar.gz" \
+            "$upload_url"
+
+          echo "Configuration uploaded: ${configuration_id}"
+          echo "configuration_id=${configuration_id}" >> "$GITHUB_OUTPUT"
+
+      - name: Poll Stack configuration and deployment
+        shell: bash
+        env:
+          TFC_API: https://app.terraform.io/api/v2
+          CONFIGURATION_ID: ${{ steps.upload.outputs.configuration_id }}
+          STACK_URL: ${{ steps.upsert.outputs.stack_url }}
+          POLL_INTERVAL_SECONDS: "15"
+          POLL_TIMEOUT_SECONDS: "2400"
+        run: |
+          set -euo pipefail
+
+          api() {
+            curl --fail-with-body --silent --show-error \
+              --header "Authorization: Bearer ${TF_TOKEN_app_terraform_io}" \
+              --header "Content-Type: application/vnd.api+json" \
+              "$@"
+          }
+
+          echo "Monitoring Stack: ${STACK_URL}"
+          echo "Configuration ID: ${CONFIGURATION_ID}"
+
+          elapsed=0
+          run_seen=false
+
+          while (( elapsed < POLL_TIMEOUT_SECONDS )); do
+            configuration="$(api \
+              "${TFC_API}/stack-configurations/${CONFIGURATION_ID}")"
+
+            config_status="$(jq -r '.data.attributes.status // "unknown"' \
+              <<< "$configuration")"
+
+            echo "Configuration status: ${config_status}"
+
+            if [[ "$config_status" == "errored" || "$config_status" == "failed" ]]; then
+              echo "::error::Stack configuration preparation failed."
+              api "${TFC_API}/stack-configurations/${CONFIGURATION_ID}/stack-diagnostics" \
+                | jq -r '.data[]? | "\(.attributes.severity): \(.attributes.summary) - \(.attributes.detail)"' \
+                || true
+              exit 1
+            fi
+
+            runs_response="$(api \
+              "${TFC_API}/stack-configurations/${CONFIGURATION_ID}/stack-deployment-runs?page%5Bsize%5D=100")"
+
+            run_count="$(jq '.data | length' <<< "$runs_response")"
+
+            if (( run_count > 0 )); then
+              run_seen=true
+
+              statuses="$(jq -r \
+                '[.data[].attributes.status] | join(",")' \
+                <<< "$runs_response")"
+
+              echo "Deployment run statuses: ${statuses}"
+
+              # Every run must finish successfully.
+              if jq -e \
+                '(.data | length) > 0 and
+                 all(.data[];
+                   .attributes.status == "succeeded")' \
+                <<< "$runs_response" >/dev/null; then
+                echo "All deployment runs succeeded."
+                exit 0
+              fi
+
+              # These states indicate a run has terminated unsuccessfully
+              # or is waiting for an operator instead of completing on its own.
+              if jq -e \
+                'any(.data[];
+                  .attributes.status == "failed" or
+                  .attributes.status == "abandoned" or
+                  .attributes.status == "pre-deploying-pending-operator" or
+                  .attributes.status == "deploying-pending-operator")' \
+                <<< "$runs_response" >/dev/null; then
+                echo "::error::A deployment run failed, was abandoned, or requires operator intervention."
+                exit 1
+              fi
+            fi
+
+            sleep "$POLL_INTERVAL_SECONDS"
+            elapsed=$((elapsed + POLL_INTERVAL_SECONDS))
+          done
+
+          if [[ "$run_seen" != "true" ]]; then
+            echo "::error::No deployment runs appeared before the polling timeout."
+          else
+            echo "::error::Deployment runs did not complete before the polling timeout."
+          fi
+
+          echo "Inspect the Stack for diagnostics: ${STACK_URL}"
+          exit 1
