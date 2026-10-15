@@ -130,16 +130,19 @@ func TestProvider_Configure_MSSQLEngine(t *testing.T) {
 func TestProvider_Configure_MSSQLEngine_WithServicePrincipal(t *testing.T) {
 	ctx := context.Background()
 	p := &AzsqlaccessProvider{}
-	objType := schemaObjectType(t, ctx, providerSchema(t))
+	objType := schemaObjectType(t, ctx, providerSchema(t)) // Build a full map of attribute values (nil defaults) then override the ones we want.
+	values := map[string]tftypes.Value{}
+	for name, at := range objType.AttributeTypes {
+		values[name] = tftypes.NewValue(at, nil)
+	}
+	values["engine"] = tftypes.NewValue(tftypes.String, "mssql")
+	values["tenant_id"] = tftypes.NewValue(tftypes.String, "00000000-0000-0000-0000-000000000000")
+	values["client_id"] = tftypes.NewValue(tftypes.String, "00000000-0000-0000-0000-000000000000")
+	values["client_secret"] = tftypes.NewValue(tftypes.String, "secret")
+
 	cfg := tfsdk.Config{
 		Schema: providerSchema(t),
-		Raw: tftypes.NewValue(objType, map[string]tftypes.Value{
-			"engine":         tftypes.NewValue(tftypes.String, "mssql"),
-			"tenant_id":      tftypes.NewValue(tftypes.String, "00000000-0000-0000-0000-000000000000"),
-			"client_id":      tftypes.NewValue(tftypes.String, "00000000-0000-0000-0000-000000000000"),
-			"client_secret":  tftypes.NewValue(tftypes.String, "secret"),
-			"login_username": tftypes.NewValue(tftypes.String, nil),
-		}),
+		Raw:    tftypes.NewValue(objType, values),
 	}
 	resp := &provider.ConfigureResponse{}
 	p.Configure(ctx, provider.ConfigureRequest{Config: cfg}, resp)
@@ -152,15 +155,22 @@ func TestProvider_Configure_PostgresEngine(t *testing.T) {
 	ctx := context.Background()
 	p := &AzsqlaccessProvider{}
 	objType := schemaObjectType(t, ctx, providerSchema(t))
+
+	// Build a full map of attribute values (nil defaults) then override the ones we want.
+	values := map[string]tftypes.Value{}
+	for name, at := range objType.AttributeTypes {
+		values[name] = tftypes.NewValue(at, nil)
+	}
+	values["engine"] = tftypes.NewValue(tftypes.String, "postgres")
+	values["tenant_id"] = tftypes.NewValue(tftypes.String, "00000000-0000-0000-0000-000000000000")
+	values["client_id"] = tftypes.NewValue(tftypes.String, "00000000-0000-0000-0000-000000000000")
+	values["client_secret"] = tftypes.NewValue(tftypes.String, "secret")
+	// login_username can stay nil if you prefer, but it's safe to set to nil explicitly
+	values["login_username"] = tftypes.NewValue(tftypes.String, nil)
+
 	cfg := tfsdk.Config{
 		Schema: providerSchema(t),
-		Raw: tftypes.NewValue(objType, map[string]tftypes.Value{
-			"engine":         tftypes.NewValue(tftypes.String, "postgres"),
-			"tenant_id":      tftypes.NewValue(tftypes.String, "00000000-0000-0000-0000-000000000000"),
-			"client_id":      tftypes.NewValue(tftypes.String, "00000000-0000-0000-0000-000000000000"),
-			"client_secret":  tftypes.NewValue(tftypes.String, "secret"),
-			"login_username": tftypes.NewValue(tftypes.String, nil),
-		}),
+		Raw:    tftypes.NewValue(objType, values),
 	}
 	resp := &provider.ConfigureResponse{}
 	p.Configure(ctx, provider.ConfigureRequest{Config: cfg}, resp)
@@ -176,15 +186,20 @@ func TestProvider_Configure_UnsupportedEngine(t *testing.T) {
 	ctx := context.Background()
 	p := &AzsqlaccessProvider{}
 	objType := schemaObjectType(t, ctx, providerSchema(t))
+
+	values := map[string]tftypes.Value{}
+	for name, at := range objType.AttributeTypes {
+		values[name] = tftypes.NewValue(at, nil)
+	}
+	values["engine"] = tftypes.NewValue(tftypes.String, "oracle")
+	values["tenant_id"] = tftypes.NewValue(tftypes.String, nil)
+	values["client_id"] = tftypes.NewValue(tftypes.String, nil)
+	values["client_secret"] = tftypes.NewValue(tftypes.String, nil)
+	values["login_username"] = tftypes.NewValue(tftypes.String, nil)
+
 	cfg := tfsdk.Config{
 		Schema: providerSchema(t),
-		Raw: tftypes.NewValue(objType, map[string]tftypes.Value{
-			"engine":         tftypes.NewValue(tftypes.String, "oracle"),
-			"tenant_id":      tftypes.NewValue(tftypes.String, nil),
-			"client_id":      tftypes.NewValue(tftypes.String, nil),
-			"client_secret":  tftypes.NewValue(tftypes.String, nil),
-			"login_username": tftypes.NewValue(tftypes.String, nil),
-		}),
+		Raw:    tftypes.NewValue(objType, values),
 	}
 	resp := &provider.ConfigureResponse{}
 	p.Configure(ctx, provider.ConfigureRequest{Config: cfg}, resp)
