@@ -11,6 +11,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 )
 
 func TestOIDCEnabled(t *testing.T) {
@@ -200,6 +202,54 @@ func TestFetchGitHubOIDCToken_MalformedJSON(t *testing.T) {
 	_, err := fetchGitHubOIDCToken(context.Background(), srv.Client(), srv.URL, "tok")
 	if err == nil || !strings.Contains(err.Error(), "decoding OIDC response") {
 		t.Fatalf("expected decode error, got %v", err)
+	}
+}
+
+// New tests added to validate explicit-argument enablement and separation of token resolution from enablement.
+func TestBuildEntraCredential_OIDC_EnabledByArgument(t *testing.T) {
+	clearOIDCEnv(t)
+
+	// Ensure tenant and client IDs are available; BuildEntraCredential will use
+	// the environment values when empty strings are passed for tenant/client.
+	t.Setenv("ARM_TENANT_ID", "00000000-0000-0000-0000-000000000000")
+	t.Setenv("ARM_CLIENT_ID", "11111111-1111-1111-1111-111111111111")
+
+	// Call BuildEntraCredential with explicit useOIDC=true (first optional arg)
+	// and an explicit token (second optional arg). This should select the OIDC path.
+	cred, err := BuildEntraCredential("", "", "", true, "dummy-argument-jwt")
+	if err != nil {
+		t.Fatalf("BuildEntraCredential with explicit useOIDC and token failed: %v", err)
+	}
+	if cred == nil {
+		t.Fatal("credential is nil")
+	}
+}
+
+func TestBuildEntraCredential_ExplicitTokenDoesNotEnableOIDC(t *testing.T) {
+	clearOIDCEnv(t)
+
+	// Supply a token in the environment but do NOT enable ARM_USE_OIDC.
+	t.Setenv("ARM_OIDC_TOKEN", "dummy-env-jwt")
+	t.Setenv("ARM_USE_OIDC", "")
+
+	// Calling BuildEntraCredential without enabling OIDC should NOT select the
+	// OIDC client-assertion credential path even if an OIDC token exists in the
+	// environment. Two outcomes are possible depending on the test environment:
+	//  - no ambient credential available -> BuildEntraCredential returns an error
+	//  - ambient credential available (e.g., az cli) -> returns an ambient credential
+	// In either case, we must NOT get a ClientAssertionCredential.
+	cred, err := BuildEntraCredential("", "", "")
+	if err != nil {
+		// acceptable: no ambient credential available in this environment
+		return
+	}
+
+	// If we got a credential, ensure it's not the OIDC client-assertion type.
+	switch cred.(type) {
+	case *azidentity.ClientAssertionCredential:
+		t.Fatalf("unexpected OIDC client-assertion credential when OIDC not enabled")
+	default:
+		// ok: ambient or other credential returned
 	}
 }
 
