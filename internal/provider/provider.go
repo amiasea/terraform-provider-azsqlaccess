@@ -38,6 +38,11 @@ type providerModel struct {
 	ClientID      types.String `tfsdk:"client_id"`
 	ClientSecret  types.String `tfsdk:"client_secret"`
 	LoginUsername types.String `tfsdk:"login_username"`
+
+	// OIDC configuration (optional)
+	OIDCToken         types.String `tfsdk:"oidc_token"`
+	OIDCTokenFilePath types.String `tfsdk:"oidc_token_file_path"`
+	UseOIDC           types.Bool   `tfsdk:"use_oidc"`
 }
 
 func (p *AzsqlaccessProvider) Metadata(_ context.Context, _ provider.MetadataRequest, resp *provider.MetadataResponse) {
@@ -80,7 +85,7 @@ func (p *AzsqlaccessProvider) Schema(_ context.Context, _ provider.SchemaRequest
 				MarkdownDescription: "Service principal client secret. Falls back to `AZURE_CLIENT_SECRET` " +
 					"then `ARM_CLIENT_SECRET`. Sensitive — never written to plan output. " +
 					"Set together with `tenant_id` and `client_id` to use client-secret auth; otherwise the " +
-					"provider falls through to OIDC (when `ARM_USE_OIDC=true`) or the ambient chain " +
+					"provider falls through to OIDC (when `ARM_USE_OIDC=true` or `use_oidc = true`) or the ambient chain " +
 					"(Azure CLI → Workload Identity → Managed Identity).",
 				Optional:  true,
 				Sensitive: true,
@@ -104,6 +109,24 @@ func (p *AzsqlaccessProvider) Schema(_ context.Context, _ provider.SchemaRequest
 					"Leave unset to connect as the caller itself — its UPN for a user, its client ID for a " +
 					"service principal or managed identity — which requires that principal to be an " +
 					"administrator in its own right.",
+				Optional: true,
+			},
+			// OIDC fields
+			"oidc_token": schema.StringAttribute{
+				MarkdownDescription: "An OIDC ID token (federated client assertion) to use for federated auth. " +
+					"Optional. Falls back to the `ARM_OIDC_TOKEN` environment variable if not set in HCL. " +
+					"Sensitive — never written to plan output.",
+				Optional:  true,
+				Sensitive: true,
+			},
+			"oidc_token_file_path": schema.StringAttribute{
+				MarkdownDescription: "Path to a file containing an OIDC ID token. Optional. Falls back to " +
+					"`ARM_OIDC_TOKEN_FILE_PATH`.",
+				Optional: true,
+			},
+			"use_oidc": schema.BoolAttribute{
+				MarkdownDescription: "Enable OIDC authentication mechanisms. Optional. Falls back to the " +
+					"`ARM_USE_OIDC` environment variable. Defaults to `false`.",
 				Optional: true,
 			},
 		},
@@ -143,6 +166,16 @@ func (p *AzsqlaccessProvider) ValidateConfig(ctx context.Context, req provider.V
 	}
 }
 
+// parseARMUseOIDC reads ARM_USE_OIDC the same way as the credential package.
+func parseARMUseOIDC() bool {
+	switch os.Getenv("ARM_USE_OIDC") {
+	case "1", "true", "yes", "on", "TRUE", "Yes":
+		return true
+	default:
+		return false
+	}
+}
+
 // Configure runs once at startup. It builds an engine-agnostic Entra credential
 // first, then selects the engine-specific ConnectorFactory based on the engine
 // attribute. Adding a new engine means adding a case here — nothing else changes.
@@ -158,10 +191,29 @@ func (p *AzsqlaccessProvider) Configure(ctx context.Context, req provider.Config
 	clientSecret := cmp.Or(config.ClientSecret.ValueString(), os.Getenv("AZURE_CLIENT_SECRET"), os.Getenv("ARM_CLIENT_SECRET"))
 	loginUsername := cmp.Or(config.LoginUsername.ValueString(), os.Getenv("AZSQLACCESS_LOGIN_USERNAME"))
 
+	// Resolve OIDC inputs: explicit provider value takes precedence over env.
+	var oidcToken string
+	if !config.OIDCToken.IsNull() && !config.OIDCToken.IsUnknown() {
+		oidcToken = config.OIDCToken.ValueString()
+	} else {
+		oidcToken = os.Getenv("ARM_OIDC_TOKEN")
+	}
+	var oidcTokenFilePath string
+	if !config.OIDCTokenFilePath.IsNull() && !config.OIDCTokenFilePath.IsUnknown() {
+		oidcTokenFilePath = config.OIDCTokenFilePath.ValueString()
+	} else {
+		oidcTokenFilePath = os.Getenv("ARM_OIDC_TOKEN_FILE_PATH")
+	}
+	var useOIDC bool
+	if !config.UseOIDC.IsNull() && !config.UseOIDC.IsUnknown() {
+		useOIDC = config.UseOIDC.ValueBool()
+	} else {
+		useOIDC = parseARMUseOIDC()
+	}
+
 	// Single Entra credential, shared by both engines. Precedence inside
-	// BuildEntraCredential: explicit SP → ARM_USE_OIDC → ambient chain
-	// (Azure CLI → Workload Identity → Managed Identity).
-	cred, err := database.BuildEntraCredential(tenantID, clientID, clientSecret)
+	// BuildEntraCredential: explicit SP → ARM_USE_OIDC / use_oidc → explicit oidc_token/token_file_path → GitHub Actions → ambient chain
+	cred, err := database.BuildEntraCredential(tenantID, clientID, clientSecret, useOIDC, oidcToken, oidcTokenFilePath, os.Getenv("ACTIONS_ID_TOKEN_REQUEST_URL"), os.Getenv("ACTIONS_ID_TOKEN_REQUEST_TOKEN"))
 	if err != nil {
 		resp.Diagnostics.AddError("Failed to initialise Azure credential", err.Error())
 		return
