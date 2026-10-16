@@ -150,7 +150,6 @@ jobs:
           }
 
           echo "Upsert stage: find or create Project"
-          # Find or create the Project.
           projects="$(api \
             "${TFC_API}/organizations/${TFC_ORGANIZATION}/projects?page%5Bsize%5D=100")"
 
@@ -160,6 +159,8 @@ jobs:
             <<< "$projects")"
 
           if [[ -z "$project_id" ]]; then
+            echo "Project not found; creating: ${TFC_PROJECT_NAME}"
+
             project_payload="$(jq -n \
               --arg name "$TFC_PROJECT_NAME" \
               '{
@@ -177,6 +178,8 @@ jobs:
               "${TFC_API}/organizations/${TFC_ORGANIZATION}/projects")"
 
             project_id="$(jq -r '.data.id' <<< "$project")"
+          else
+            echo "Found Project: ${TFC_PROJECT_NAME}"
           fi
 
           test -n "$project_id"
@@ -184,7 +187,6 @@ jobs:
           echo "Project ID: ${project_id}"
 
           echo "Upsert stage: list Stacks and find target Stack"
-          # Find the Stack in this Project.
           stacks="$(api \
             "${TFC_API}/organizations/${TFC_ORGANIZATION}/stacks?page%5Bsize%5D=100")"
 
@@ -197,7 +199,6 @@ jobs:
               | .id][0] // empty' <<< "$stacks")"
 
           echo "Upsert stage: prepare Stack payload"
-          # Explicitly assign the Stack to the configured agent pool.
           stack_payload="$(jq -n \
             --arg name "$TFC_STACK_NAME" \
             --arg project "$project_id" \
@@ -205,155 +206,6 @@ jobs:
             '{
               data: {
                 type: "stacks",
-                attributes: {
-                  name: $name,
-                  description: "Custom azsqlaccess provider integration test",
-                  "execution-mode": "agent",
-                  "setting-overwrites": {
-                    "execution-mode": true,
-                    "agent-pool": true
-                  },
-                  "trigger-disabled": false,
-                  "speculative-enabled": false
-                },
-                relationships: {
-                  project: {
-                    data: {type: "projects", id: $project}
-                  },
-                  "agent-pool": {
-                    data: {type: "agent-pools", id: $pool}
-                  }
-                }
-              }
-            }')"
-
-          if [[ -z "$stack_id" ]]; then
-            echo "Upsert stage: create Stack"
-            stack="$(api --request POST \
-              --data "$stack_payload" \
-              "${TFC_API}/stacks")"
-            stack_id="$(jq -r '.data.id' <<< "$stack")"
-          else
-            echo "Upsert stage: update Stack ${stack_id}"
-            api --request PATCH \
-              --data "$stack_payload" \
-              "${TFC_API}/stacks/${stack_id}" >/dev/null
-          fi
-
-          test -n "$stack_id"
-          test "$stack_id" != "null"
-
-          echo "Upsert stage: find or create Project variable set"
-          # Find or create a variable set owned by this Project.
-          varsets="$(api \
-            "${TFC_API}/projects/${project_id}/varsets?page%5Bsize%5D=100")"
-
-          varset_id="$(jq -r \
-            --arg name "$TFC_VARSET_NAME" \
-            --arg project "$project_id" \
-            '[.data[]
-              | select(.attributes.name == $name)
-              | select(.relationships.parent.data.id == $project)
-              | .id][0] // empty' <<< "$varsets")"
-
-          if [[ -z "$varset_id" ]]; then
-            echo "Upsert stage: create variable set"
-            varset_payload="$(jq -n \
-              --arg name "$TFC_VARSET_NAME" \
-              --arg project "$project_id" \
-              '{
-                data: {
-                  type: "varsets",
-                  attributes: {
-                    name: $name,
-                    description: "Repository variables for provider integration tests",
-                    global: false,
-                    priority: false
-                  },
-                  relationships: {
-                    parent: {
-                      data: {type: "projects", id: $project}
-                    }
-                  }
-                }
-              }')"
-
-            varset="$(api --request POST \
-              --data "$varset_payload" \
-              "${TFC_API}/organizations/${TFC_ORGANIZATION}/varsets")"
-
-            varset_id="$(jq -r '.data.id' <<< "$varset")"
-          fi
-
-          test -n "$varset_id"
-          test "$varset_id" != "null"
-
-          echo "Upsert stage: synchronize variable-set variables"
-          # Reconcile Terraform variables with GitHub repository variables.
-          # Existing keys are updated; missing keys are added.
-          vars_response="$(api \
-            "${TFC_API}/varsets/${varset_id}/relationships/vars?page%5Bsize%5D=100")"
-
-          sync_var() {
-            local key="$1"
-            local value="$2"
-            local var_id
-            local payload
-
-            var_id="$(jq -r \
-              --arg key "$key" \
-              '[.data[] | select(.attributes.key == $key) | .id][0] // empty' \
-              <<< "$vars_response")"
-
-            payload="$(jq -n \
-              --arg key "$key" \
-              --arg value "$value" \
-              '{
-                data: {
-                  type: "vars",
-                  attributes: {
-                    key: $key,
-                    value: $value,
-                    category: "terraform",
-                    hcl: false,
-                    sensitive: false
-                  }
-                }
-              }')"
-
-            if [[ -n "$var_id" ]]; then
-              api --request PATCH \
-                --data "$payload" \
-                "${TFC_API}/varsets/${varset_id}/relationships/vars/${var_id}" \
-                >/dev/null
-              echo "Updated variable: ${key}"
-            else
-              api --request POST \
-                --data "$payload" \
-                "${TFC_API}/varsets/${varset_id}/relationships/vars" \
-                >/dev/null
-              echo "Created variable: ${key}"
-            fi
-          }
-
-          sync_var azure_tenant_id "$AZURE_TENANT_ID"
-          sync_var azure_client_id "$AZURE_CLIENT_ID"
-          sync_var azure_subscription_id "$AZURE_SUBSCRIPTION_ID"
-          sync_var azure_database_host "$AZURE_DATABASE_HOST"
-          sync_var azure_database_name "$AZURE_DATABASE_NAME"
-          sync_var entra_group_display_name "$ENTRA_GROUP_DISPLAY_NAME"
-
-          echo "Project ID: ${project_id}"
-          echo "Stack ID: ${stack_id}"
-          echo "Variable set ID: ${varset_id}"
-
-          echo "TFC_PROJECT_ID=${project_id}" >> "$GITHUB_ENV"
-          echo "TFC_STACK_ID=${stack_id}" >> "$GITHUB_ENV"
-          echo "TFC_VARSET_ID=${varset_id}" >> "$GITHUB_ENV"
-
-          stack_url="https://app.terraform.io/app/${TFC_ORGANIZATION}/stacks/${stack_id}"
-          echo "stack_url=${stack_url}" >> "$GITHUB_OUTPUT"
-          echo "Stack URL: ${stack_url}"
 
       - name: Package Stack configuration
         shell: bash
