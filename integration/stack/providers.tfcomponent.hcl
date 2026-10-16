@@ -6,7 +6,7 @@ required_providers {
 
   azsqlaccess = {
     source  = "app.terraform.io/amiasea-development/azsqlaccess"
-    version = "1.0.2"
+    version = "1.0.3"
   }
 }
 

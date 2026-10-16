@@ -2,12 +2,12 @@
 # Manual edits may be lost in future updates.
 
 provider "app.terraform.io/amiasea-development/azsqlaccess" {
-  version = "1.0.2"
+  version = "1.0.3"
   hashes = [
-    "h1:1zqp6pvyRvvF6bPAtdIDCfU6UuT178eUFqvejOHWRx0=",
-    "h1:AY5jEPzA+pXAmfr2OU+URXpOeg7nsbQkFtlq02oR4xM=",
-    "zh:085830a2b31e22b3b604ee3560ebebba76bbe525083dfea6dce553ab192eaf4e",
-    "zh:34d775142f65bd21c8e8e687bbd51718ac18da8ddd28787e4e0e51b96f97bf12",
+    "h1:LXbFaqC/ex4dtt3pVyPvNTUINDYt7GVCbZ/NyKlwhjc=",
+    "h1:oDBBvgEyMvFVig9DM3otIlxSxiClj2GueRc2a/8N9Yk=",
+    "zh:1fcc049f0495191866a52bfe05164ae8af4f3e22a1c5faaa360d31bd12ce3852",
+    "zh:2bf6f3f970263b3715c3ccaa35de70b4452470b162114eb6a8065823869fb436",
   ]
 }
 
