@@ -29,5 +29,7 @@ provider "azsqlaccess" "this" {
     client_id = var.azure_client_id
 
     oidc_token = var.azure_identity_token
+
+    use_oidc = true
   }
 }
