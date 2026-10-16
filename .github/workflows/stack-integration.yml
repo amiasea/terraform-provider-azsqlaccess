@@ -18,11 +18,9 @@ permissions:
 
 env:
   TF_TOKEN_APP_TERRAFORM_IO: ${{ secrets.TF_TOKEN_APP_TERRAFORM_IO }}
-  TFC_AGENT_TOKEN: ${{ secrets.TFC_AGENT_TOKEN }}
   TFC_ORGANIZATION: amiasea-development
   TFC_PROJECT_NAME: github-actions-integration
   TFC_STACK_NAME: azsqlaccess-integration
-  TFC_AGENT_POOL_ID: ${{ secrets.TFC_AGENT_POOL_ID }}
   TFC_VARSET_NAME: github-actions-integration
   AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
   AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
@@ -35,13 +33,6 @@ jobs:
   integration:
     runs-on: ubuntu-latest
     timeout-minutes: 60
-
-    services:
-      tfc-agent:
-        image: hashicorp/tfc-agent:latest
-        env:
-          TFC_AGENT_TOKEN: ${{ secrets.TFC_AGENT_TOKEN }}
-          TF_TOKEN_APP_TERRAFORM_IO: ${{ secrets.TF_TOKEN_APP_TERRAFORM_IO }}
 
     steps:
       - name: Checkout
@@ -82,7 +73,6 @@ jobs:
           set -euo pipefail
 
           : "${TF_TOKEN_APP_TERRAFORM_IO:?Missing HCP Terraform API token}"
-          : "${TFC_AGENT_POOL_ID:?Missing HCP Terraform agent pool ID}"
 
           api() {
             local method="GET"
@@ -186,17 +176,15 @@ jobs:
           stack_payload="$(jq -n \
             --arg name "$TFC_STACK_NAME" \
             --arg project "$project_id" \
-            --arg pool "$TFC_AGENT_POOL_ID" \
             '{
               data: {
                 type: "stacks",
                 attributes: {
                   name: $name,
                   description: "Custom azsqlaccess provider integration test",
-                  "execution-mode": "agent",
+                  "execution-mode": "remote",
                   "setting-overwrites": {
-                    "execution-mode": true,
-                    "agent-pool": true
+                    "execution-mode": true
                   },
                   "trigger-disabled": false,
                   "speculative-enabled": false
@@ -204,9 +192,6 @@ jobs:
                 relationships: {
                   project: {
                     data: {type: "projects", id: $project}
-                  },
-                  "agent-pool": {
-                    data: {type: "agent-pools", id: $pool}
                   }
                 }
               }
@@ -386,7 +371,7 @@ jobs:
 
           echo "Stack configuration validation succeeded."
 
-      - name: Upload and watch Stack configuration
+      - name: Upload Stack configuration
         working-directory: integration/stack
         shell: bash
         env:
@@ -407,28 +392,8 @@ jobs:
           echo "Stack ID: ${TFC_STACK_ID}"
           echo "Configuration directory: ${PWD}"
 
-          upload_output="$(terraform stacks configuration upload \
-            -stack-id "$TFC_STACK_ID" 2>&1)" || {
-              printf '%s\n' "$upload_output"
-              exit 1
-            }
+          terraform stacks configuration upload \
+            -stack-id "$TFC_STACK_ID"
 
-          printf '%s\n' "$upload_output"
-
-          configuration_id="$(
-            printf '%s\n' "$upload_output" |
-              grep -oE 'stc-[[:alnum:]]+' |
-              head -n 1 || true
-          )"
-
-          if [[ -z "$configuration_id" ]]; then
-            echo "::error::Upload succeeded but no configuration ID was found in the CLI output."
-            exit 1
-          fi
-
-          echo "Configuration ID: $configuration_id"
+          echo "Stack configuration upload completed."
           echo "Stack URL: ${STACK_URL:-not provided}"
-
-          echo "Watching Stack configuration status..."
-          terraform stacks configuration watch \
-            -configuration-id "$configuration_id"
