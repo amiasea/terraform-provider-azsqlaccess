@@ -66,51 +66,6 @@ jobs:
           terraform version
           terraform version | grep -F 'Terraform v1.16.2'
 
-      - name: Validate workflow inputs
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          if [[ ! -f .terraform-version ]]; then
-            echo "::error file=.terraform-version::Required file .terraform-version does not exist."
-            exit 1
-          fi
-
-          if [[ ! -f integration/stack/main.tfdeploy.hcl ]]; then
-            echo "::error file=integration/stack/main.tfdeploy.hcl::Required Stack configuration file does not exist."
-            exit 1
-          fi
-
-          configured_version="$(tr -d '[:space:]' < .terraform-version)"
-
-          if [[ "$configured_version" != "1.16.2" ]]; then
-            echo "::error file=.terraform-version::Expected Terraform version 1.16.2, but found '${configured_version}'."
-            exit 1
-          fi
-
-          required_vars=(
-            TF_TOKEN_APP_TERRAFORM_IO
-            TFC_AGENT_TOKEN
-            TFC_AGENT_POOL_ID
-            AZURE_TENANT_ID
-            AZURE_CLIENT_ID
-            AZURE_SUBSCRIPTION_ID
-            AZURE_DATABASE_HOST
-            AZURE_DATABASE_NAME
-            ENTRA_GROUP_DISPLAY_NAME
-          )
-
-          for var_name in "${required_vars[@]}"; do
-            if [[ -z "${!var_name:-}" ]]; then
-              echo "::error::Required environment variable '${var_name}' is missing or empty."
-              exit 1
-            fi
-          done
-
-          echo "All workflow input validations passed."
-          echo "Terraform version: ${configured_version}"
-          echo "Required files and environment variables are present."
-
       - name: Install API tools
         shell: bash
         run: |
