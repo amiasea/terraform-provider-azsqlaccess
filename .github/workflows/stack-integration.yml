@@ -1,3 +1,4 @@
+
 name: Stack Integration
 
 on:
@@ -21,13 +22,11 @@ env:
   TF_TOKEN_app_terraform_io: ${{ secrets.TF_TOKEN_APP_TERRAFORM_IO }}
   TF_CLI_CONFIG_FILE: ${{ github.workspace }}/dev.tfrc
   TFC_AGENT_TOKEN: ${{ secrets.TFC_AGENT_TOKEN }}
-
   TFC_ORGANIZATION: amiasea-development
   TFC_PROJECT_NAME: github-actions-integration
   TFC_STACK_NAME: azsqlaccess-integration
   TFC_AGENT_POOL_ID: ${{ secrets.TFC_AGENT_POOL_ID }}
   TFC_VARSET_NAME: github-actions-integration
-
   AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
   AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
   AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
@@ -407,342 +406,33 @@ jobs:
           echo "stack_url=${stack_url}" >> "$GITHUB_OUTPUT"
           echo "Stack URL: ${stack_url}"
 
-      - name: Package Stack configuration
+      - name: Set up Terraform CLI
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.15.3"
+          cli_config_credentials_token: ${{ secrets.TF_TOKEN_APP_TERRAFORM_IO }}
+
+      - name: Upload Stack configuration with Terraform Stacks CLI
+        working-directory: integration/stack
         shell: bash
         run: |
           set -euo pipefail
 
-          test -d integration/stack
-          test -f integration/stack/main.tfdeploy.hcl
-
-          tar -czf "$RUNNER_TEMP/stack-configuration.tar.gz" \
-            -C integration/stack .
-
-      - name: Upload Stack configuration
-        id: upload
-        shell: bash
-        env:
-          TFC_API: https://app.terraform.io/api/v2
-        run: |
-          set -euo pipefail
-
-          : "${TF_TOKEN_app_terraform_io:?Missing HCP Terraform API token}"
           : "${TFC_STACK_ID:?Missing Stack ID from upsert step}"
-
-          api() {
-            local method="GET"
-            local arg=""
-            local previous=""
-            local url="${@: -1}"
-            local response_file
-            local status
-
-            for arg in "$@"; do
-              if [[ "$previous" == "--request" ]]; then
-                method="$arg"
-              elif [[ "$arg" == "--data" || "$arg" == "--data-raw" || "$arg" == "--data-binary" ]]; then
-                if [[ "$method" == "GET" ]]; then
-                  method="POST"
-                fi
-              fi
-              previous="$arg"
-            done
-
-            echo "::group::HCP API ${method} ${url}" >&2
-            response_file="$(mktemp)"
-
-            if ! status="$(curl --silent --show-error \
-              --output "$response_file" \
-              --write-out '%{http_code}' \
-              --header "Authorization: Bearer ${TF_TOKEN_app_terraform_io}" \
-              --header "Content-Type: application/vnd.api+json" \
-              "$@")"; then
-              echo "::error::HCP API transport failure: ${method} ${url}" >&2
-              cat "$response_file" >&2 || true
-              rm -f "$response_file"
-              echo "::endgroup::" >&2
-              return 1
-            fi
-
-            echo "HTTP status: ${status}" >&2
-
-            if [[ "$status" -lt 200 || "$status" -ge 300 ]]; then
-              echo "::error::HCP API request failed: ${method} ${url}" >&2
-              echo "Response body:" >&2
-              cat "$response_file" >&2
-              rm -f "$response_file"
-              echo "::endgroup::" >&2
-              return 22
-            fi
-
-            cat "$response_file"
-            rm -f "$response_file"
-            echo "::endgroup::" >&2
-          }
-
-          # Create a non-speculative configuration version.
-          configuration="$(api --request POST \
-            --data '{"data":{"attributes":{"speculative":false}}}' \
-            "${TFC_API}/stacks/${TFC_STACK_ID}/stack-configurations?source=manual")"
-
-          configuration_id="$(jq -r '.data.id // empty' <<< "$configuration")"
-          test -n "$configuration_id"
-          test "$configuration_id" != "null"
-
-          upload="$(api \
-            "${TFC_API}/stack-configurations/${configuration_id}/upload-url")"
-
-          upload_url="$(jq -r '.data."source-upload-url" // empty' <<< "$upload")"
-          test -n "$upload_url"
-          test "$upload_url" != "null"
-
-          # The temporary upload URL is a bearer capability.
-          # Do not print it or send the HCP API token to this URL.
-          upload_response="$RUNNER_TEMP/stack-upload-response.txt"
-          upload_status="$(curl --silent --show-error \
-            --output "$upload_response" \
-            --write-out '%{http_code}' \
-            --request PUT \
-            --header "Content-Type: application/octet-stream" \
-            --data-binary @"$RUNNER_TEMP/stack-configuration.tar.gz" \
-            "$upload_url")"
-
-          echo "Stack archive upload HTTP status: ${upload_status}"
-
-          if [[ "$upload_status" -lt 200 || "$upload_status" -ge 300 ]]; then
-            echo "::error::Stack archive upload failed with HTTP ${upload_status}"
-            cat "$upload_response"
-            exit 22
-          fi
-
-          echo "Configuration uploaded: ${configuration_id}"
-          echo "configuration_id=${configuration_id}" >> "$GITHUB_OUTPUT"
-
-      - name: Diagnose Stack configuration
-        if: always()
-        shell: bash
-        env:
-          TFC_API: https://app.terraform.io/api/v2
-          CONFIGURATION_ID: ${{ steps.upload.outputs.configuration_id }}
-        run: |
-          set -euo pipefail
-
-          if [[ -z "${CONFIGURATION_ID:-}" ]]; then
-            echo "No configuration ID available; upload may have failed."
-            exit 0
-          fi
-
           : "${TF_TOKEN_app_terraform_io:?Missing HCP Terraform API token}"
 
-          api() {
-            local method="GET"
-            local arg=""
-            local previous=""
-            local url="${@: -1}"
-            local response_file
-            local status
+          echo "Terraform CLI version:"
+          terraform version
 
-            for arg in "$@"; do
-              if [[ "$previous" == "--request" ]]; then
-                method="$arg"
-              elif [[ "$arg" == "--data" || "$arg" == "--data-raw" || "$arg" == "--data-binary" ]]; then
-                if [[ "$method" == "GET" ]]; then
-                  method="POST"
-                fi
-              fi
-              previous="$arg"
-            done
+          echo "Uploading Stack configuration"
+          echo "Organization: ${TFC_ORGANIZATION}"
+          echo "Project: ${TFC_PROJECT_NAME}"
+          echo "Stack: ${TFC_STACK_NAME}"
+          echo "Stack ID: ${TFC_STACK_ID}"
+          echo "Configuration directory: ${PWD}"
 
-            echo "::group::HCP API ${method} ${url}" >&2
-            response_file="$(mktemp)"
+          terraform stacks configuration upload \
+            -stack-id "$TFC_STACK_ID"
 
-            if ! status="$(curl --silent --show-error \
-              --output "$response_file" \
-              --write-out '%{http_code}' \
-              --header "Authorization: Bearer ${TF_TOKEN_app_terraform_io}" \
-              --header "Content-Type: application/vnd.api+json" \
-              "$@")"; then
-              echo "::error::HCP API transport failure: ${method} ${url}" >&2
-              cat "$response_file" >&2 || true
-              rm -f "$response_file"
-              echo "::endgroup::" >&2
-              return 1
-            fi
-
-            echo "HTTP status: ${status}" >&2
-
-            if [[ "$status" -lt 200 || "$status" -ge 300 ]]; then
-              echo "::error::HCP API request failed: ${method} ${url}" >&2
-              echo "Response body:" >&2
-              cat "$response_file" >&2
-              rm -f "$response_file"
-              echo "::endgroup::" >&2
-              return 22
-            fi
-
-            cat "$response_file"
-            rm -f "$response_file"
-            echo "::endgroup::" >&2
-          }
-
-          echo "=== Configuration details ==="
-
-          api "${TFC_API}/stack-configurations/${CONFIGURATION_ID}" |
-            jq '.data | {
-              id,
-              attributes: {
-                status: .attributes.status,
-                sequence_number: .attributes["sequence-number"],
-                updated_at: .attributes["updated-at"],
-                components: .attributes.components
-              }
-            }'
-
-          echo "=== Configuration diagnostics ==="
-
-          api "${TFC_API}/stack-configurations/${CONFIGURATION_ID}/stack-diagnostics" |
-            jq '.data[]? | {
-              severity: .attributes.severity,
-              summary: .attributes.summary,
-              detail: .attributes.detail
-            }'
-
-      - name: Poll Stack configuration and deployment
-        shell: bash
-        env:
-          TFC_API: https://app.terraform.io/api/v2
-          CONFIGURATION_ID: ${{ steps.upload.outputs.configuration_id }}
-          STACK_URL: ${{ steps.upsert.outputs.stack_url }}
-          POLL_INTERVAL_SECONDS: "15"
-          POLL_TIMEOUT_SECONDS: "2400"
-        run: |
-          set -euo pipefail
-
-          : "${TF_TOKEN_app_terraform_io:?Missing HCP Terraform API token}"
-          : "${CONFIGURATION_ID:?Missing configuration ID from upload step}"
-
-          api() {
-            local method="GET"
-            local arg=""
-            local previous=""
-            local url="${@: -1}"
-            local response_file
-            local status
-
-            for arg in "$@"; do
-              if [[ "$previous" == "--request" ]]; then
-                method="$arg"
-              elif [[ "$arg" == "--data" || "$arg" == "--data-raw" || "$arg" == "--data-binary" ]]; then
-                if [[ "$method" == "GET" ]]; then
-                  method="POST"
-                fi
-              fi
-              previous="$arg"
-            done
-
-            echo "::group::HCP API ${method} ${url}" >&2
-            response_file="$(mktemp)"
-
-            if ! status="$(curl --silent --show-error \
-              --output "$response_file" \
-              --write-out '%{http_code}' \
-              --header "Authorization: Bearer ${TF_TOKEN_app_terraform_io}" \
-              --header "Content-Type: application/vnd.api+json" \
-              "$@")"; then
-              echo "::error::HCP API transport failure: ${method} ${url}" >&2
-              cat "$response_file" >&2 || true
-              rm -f "$response_file"
-              echo "::endgroup::" >&2
-              return 1
-            fi
-
-            echo "HTTP status: ${status}" >&2
-
-            if [[ "$status" -lt 200 || "$status" -ge 300 ]]; then
-              echo "::error::HCP API request failed: ${method} ${url}" >&2
-              echo "Response body:" >&2
-              cat "$response_file" >&2
-              rm -f "$response_file"
-              echo "::endgroup::" >&2
-              return 22
-            fi
-
-            cat "$response_file"
-            rm -f "$response_file"
-            echo "::endgroup::" >&2
-          }
-
-          echo "Monitoring Stack: ${STACK_URL}"
-          echo "Configuration ID: ${CONFIGURATION_ID}"
-
-          elapsed=0
-          run_seen=false
-
-          while (( elapsed < POLL_TIMEOUT_SECONDS )); do
-            configuration="$(api \
-              "${TFC_API}/stack-configurations/${CONFIGURATION_ID}")"
-
-            config_status="$(jq -r '.data.attributes.status // "unknown"' \
-              <<< "$configuration")"
-
-            echo "Configuration status: ${config_status}"
-
-            if [[ "$config_status" == "errored" || "$config_status" == "failed" ]]; then
-              echo "::error::Stack configuration preparation failed."
-
-              api "${TFC_API}/stack-configurations/${CONFIGURATION_ID}/stack-diagnostics" \
-                | jq -r '.data[]? | "\(.attributes.severity): \(.attributes.summary) - \(.attributes.detail)"' \
-                || true
-
-              exit 1
-            fi
-
-            runs_response="$(api \
-              "${TFC_API}/stack-configurations/${CONFIGURATION_ID}/stack-deployment-runs?page%5Bsize%5D=100")"
-
-            run_count="$(jq '.data | length' <<< "$runs_response")"
-
-            if (( run_count > 0 )); then
-              run_seen=true
-
-              statuses="$(jq -r \
-                '[.data[].attributes.status] | join(",")' \
-                <<< "$runs_response")"
-
-              echo "Deployment run statuses: ${statuses}"
-
-              # All returned deployment runs must have succeeded.
-              if jq -e \
-                '(.data | length) > 0 and
-                 all(.data[];
-                   .attributes.status == "succeeded")' \
-                <<< "$runs_response" >/dev/null; then
-                echo "All deployment runs succeeded."
-                exit 0
-              fi
-
-              # Fail on terminal failures or operator-intervention states.
-              if jq -e \
-                'any(.data[];
-                  .attributes.status == "failed" or
-                  .attributes.status == "abandoned" or
-                  .attributes.status == "pre-deploying-pending-operator" or
-                  .attributes.status == "deploying-pending-operator")' \
-                <<< "$runs_response" >/dev/null; then
-                echo "::error::A deployment run failed, was abandoned, or requires operator intervention."
-                exit 1
-              fi
-            fi
-
-            sleep "$POLL_INTERVAL_SECONDS"
-            elapsed=$((elapsed + POLL_INTERVAL_SECONDS))
-          done
-
-          if [[ "$run_seen" != "true" ]]; then
-            echo "::error::No deployment runs appeared before the polling timeout."
-          else
-            echo "::error::Deployment runs did not complete before the polling timeout."
-          fi
-
-          echo "Inspect the Stack for diagnostics: ${STACK_URL}"
-          exit 1
+          echo "Stack configuration upload command completed."
+          echo "Stack URL: ${{ steps.upsert.outputs.stack_url }}"
