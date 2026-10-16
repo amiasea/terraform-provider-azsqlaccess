@@ -15,8 +15,6 @@ concurrency:
 env:
   TF_ORG: amiasea-development
   PROVIDER_NAME: azsqlaccess
-  GOOS: linux
-  GOARCH: amd64
 
 jobs:
   publish:
@@ -33,7 +31,7 @@ jobs:
           set -euo pipefail
 
           if [[ ! "$TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
-            echo "::error::Expected a stable semver tag such as v1.2.3; got '$TAG'."
+            echo "::error::Expected a stable semantic version tag such as v1.2.3; got '$TAG'."
             exit 1
           fi
 
@@ -48,33 +46,34 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: Set up GPG signing key
+      - name: Import GPG signing key
         shell: bash
         env:
           GPG_PRIVATE_KEY: ${{ secrets.HCP_PROVIDER_GPG_PRIVATE_KEY }}
-          GPG_PASSPHRASE: ${{ secrets.HCP_PROVIDER_GPG_PASSPHRASE }}
         run: |
           set -euo pipefail
 
-          test -n "$GPG_PRIVATE_KEY" || {
-            echo "::error::Missing HCP_PROVIDER_GPG_PRIVATE_KEY secret."
+          if [[ -z "$GPG_PRIVATE_KEY" ]]; then
+            echo "::error::Missing HCP_PROVIDER_GPG_PRIVATE_KEY repository secret."
             exit 1
-          }
+          fi
 
           printf '%s' "$GPG_PRIVATE_KEY" |
             gpg --batch --import
 
-          KEY_ID="$(
+          # HCP Terraform expects the registered key ID, not its full fingerprint.
+          GPG_KEY_ID="$(
             gpg --batch --with-colons --list-secret-keys |
-              awk -F: '$1 == "fpr" { print $10; exit }'
+              awk -F: '$1 == "sec" { print $5; exit }'
           )"
 
-          test -n "$KEY_ID" || {
-            echo "::error::Could not identify the imported GPG key."
+          if [[ "$GPG_KEY_ID" != "FA67D7FC943D1A35" ]]; then
+            echo "::error::Imported GPG key ID '$GPG_KEY_ID' does not match the registered key FA67D7FC943D1A35."
             exit 1
-          }
+          fi
 
-          echo "GPG_KEY_ID=$KEY_ID" >> "$GITHUB_ENV"
+          echo "GPG_KEY_ID=$GPG_KEY_ID" >> "$GITHUB_ENV"
+          echo "Imported registered GPG signing key."
 
       - name: Build Linux AMD64 provider
         shell: bash
@@ -102,25 +101,29 @@ jobs:
         run: |
           set -euo pipefail
 
-          cd dist
-
-          BINARY="terraform-provider-${PROVIDER_NAME}_v${VERSION}"
           PACKAGE="terraform-provider-${PROVIDER_NAME}_${VERSION}_linux_amd64.zip"
+          BINARY="terraform-provider-${PROVIDER_NAME}_v${VERSION}"
 
-          zip "$PACKAGE" "$BINARY"
-          sha256sum "$PACKAGE" > SHA256SUMS
+          (
+            cd dist
 
-          gpg --batch \
-            --yes \
-            --pinentry-mode loopback \
-            --passphrase "$GPG_PASSPHRASE" \
-            --detach-sign \
-            --output SHA256SUMS.sig \
-            SHA256SUMS
+            zip "$PACKAGE" "$BINARY"
+            sha256sum "$PACKAGE" > SHA256SUMS
 
-          cat SHA256SUMS
+            gpg --batch \
+              --yes \
+              --pinentry-mode loopback \
+              --passphrase "$GPG_PASSPHRASE" \
+              --local-user "$GPG_KEY_ID" \
+              --detach-sign \
+              --output SHA256SUMS.sig \
+              SHA256SUMS
 
-      - name: Check registry version and publish
+            echo "Generated package and signed checksum manifest:"
+            cat SHA256SUMS
+          )
+
+      - name: Register provider and publish version
         shell: bash
         env:
           VERSION: ${{ steps.version.outputs.version }}
@@ -128,13 +131,14 @@ jobs:
         run: |
           set -euo pipefail
 
-          test -n "$TF_TOKEN" || {
-            echo "::error::Missing TF_TOKEN_APP_TERRAFORM_IO secret."
+          if [[ -z "$TF_TOKEN" ]]; then
+            echo "::error::Missing TF_TOKEN_APP_TERRAFORM_IO repository secret."
             exit 1
-          }
+          fi
 
           API="https://app.terraform.io/api/v2"
-          BASE="$API/organizations/$TF_ORG/registry-providers/private/$TF_ORG/$PROVIDER_NAME"
+          PROVIDERS_URL="$API/organizations/$TF_ORG/registry-providers"
+          BASE="$PROVIDERS_URL/private/$TF_ORG/$PROVIDER_NAME"
 
           api() {
             curl --silent --show-error --fail-with-body \
@@ -143,20 +147,41 @@ jobs:
               "$@"
           }
 
-          # Require the provider record to exist. Do not silently create
-          # or publish into an unintended namespace.
-          api "$BASE" >/dev/null || {
-            echo "::error::Provider $TF_ORG/$PROVIDER_NAME is not registered in the private registry."
-            exit 1
-          }
+          # Create the private provider record if it does not exist.
+          if api "$BASE" >/dev/null 2>&1; then
+            echo "Provider record already exists: $TF_ORG/$PROVIDER_NAME"
+          else
+            echo "Creating private provider record: $TF_ORG/$PROVIDER_NAME"
 
-          # Explicitly reject duplicate versions before creating anything.
+            api --request POST \
+              --data "$(
+                jq -n \
+                  --arg name "$PROVIDER_NAME" \
+                  --arg namespace "$TF_ORG" \
+                  '{
+                    data: {
+                      type: "registry-providers",
+                      attributes: {
+                        name: $name,
+                        namespace: $namespace,
+                        "registry-name": "private"
+                      }
+                    }
+                  }'
+              )" \
+              "$PROVIDERS_URL" || {
+                echo "::error::Could not create provider record. Check the token, organization, and Owners-team permissions."
+                exit 1
+              }
+          fi
+
+          # Never overwrite an existing version.
           if api "$BASE/versions/$VERSION" >/dev/null 2>&1; then
-            echo "::error::Version $VERSION already exists in $TF_ORG/$PROVIDER_NAME. Refusing to overwrite it."
+            echo "::error::Version $VERSION already exists for $TF_ORG/$PROVIDER_NAME. Refusing to overwrite it."
             exit 1
           fi
 
-          echo "Creating $TF_ORG/$PROVIDER_NAME version $VERSION"
+          echo "Creating provider version $VERSION"
 
           VERSION_RESPONSE="$(
             api --request POST \
@@ -178,10 +203,15 @@ jobs:
               "$BASE/versions"
           )"
 
-          SHASUMS_URL="$(jq -er '.data.links["shasums-upload"]' <<< "$VERSION_RESPONSE")"
-          SIGNATURE_URL="$(jq -er '.data.links["shasums-sig-upload"]' <<< "$VERSION_RESPONSE")"
+          SHASUMS_URL="$(
+            jq -er '.data.links["shasums-upload"]' <<< "$VERSION_RESPONSE"
+          )"
 
-          # Upload the signed checksum manifest.
+          SIGNATURE_URL="$(
+            jq -er '.data.links["shasums-sig-upload"]' <<< "$VERSION_RESPONSE"
+          )"
+
+          # Upload the checksum manifest and its GPG signature.
           curl --silent --show-error --fail-with-body \
             --request PUT \
             --upload-file dist/SHA256SUMS \
@@ -193,8 +223,9 @@ jobs:
             "$SIGNATURE_URL"
 
           PACKAGE="terraform-provider-${PROVIDER_NAME}_${VERSION}_linux_amd64.zip"
-          SHASUM="$(awk '{print $1}' "dist/SHA256SUMS")"
+          SHASUM="$(awk '{print $1}' dist/SHA256SUMS)"
 
+          # Register the Linux AMD64 platform.
           PLATFORM_RESPONSE="$(
             api --request POST \
               --data "$(
@@ -216,14 +247,18 @@ jobs:
               "$BASE/versions/$VERSION/platforms"
           )"
 
-          BINARY_URL="$(jq -er '.data.links["provider-binary-upload"]' <<< "$PLATFORM_RESPONSE")"
+          BINARY_URL="$(
+            jq -er '.data.links["provider-binary-upload"]' \
+              <<< "$PLATFORM_RESPONSE"
+          )"
 
+          # Upload the provider archive.
           curl --silent --show-error --fail-with-body \
             --request PUT \
             --upload-file "dist/$PACKAGE" \
             "$BINARY_URL"
 
-          echo "Published $TF_ORG/$PROVIDER_NAME v$VERSION (linux_amd64)."
+          echo "Uploaded $TF_ORG/$PROVIDER_NAME v$VERSION (linux_amd64)."
 
       - name: Verify published platform
         shell: bash
@@ -242,15 +277,16 @@ jobs:
               "$URL"
           )"
 
-          echo "$RESPONSE" | jq '{
-            version: .data.attributes.version,
+          jq '{
             os: .data.attributes.os,
             arch: .data.attributes.arch,
             filename: .data.attributes.filename,
             provider_binary_uploaded: .data.attributes["provider-binary-uploaded"]
-          }'
+          }' <<< "$RESPONSE"
 
-          test "$(jq -r '.data.attributes["provider-binary-uploaded"]' <<< "$RESPONSE")" = "true" || {
-            echo "::error::Registry did not confirm the provider binary upload."
+          if [[ "$(jq -r '.data.attributes["provider-binary-uploaded"]' <<< "$RESPONSE")" != "true" ]]; then
+            echo "::error::HCP Terraform did not confirm the provider binary upload."
             exit 1
-          }
+          fi
+
+          echo "Verified published provider $TF_ORG/$PROVIDER_NAME v$VERSION."
