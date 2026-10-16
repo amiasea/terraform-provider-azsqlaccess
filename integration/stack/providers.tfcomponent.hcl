@@ -5,8 +5,8 @@ required_providers {
   }
 
   mssql = {
-    source  = "MewsSystems/azsqlaccess"
-    version = "~> 1.0.0"
+    source  = "amiasea-development/azsqlaccess"
+    version = "1.0.0"
   }
 }
 

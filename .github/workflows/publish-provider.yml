@@ -1,0 +1,256 @@
+name: Publish Provider
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-provider-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  TF_ORG: amiasea-development
+  PROVIDER_NAME: azsqlaccess
+  GOOS: linux
+  GOARCH: amd64
+
+jobs:
+  publish:
+    name: Publish azsqlaccess provider
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Validate semantic version tag
+        id: version
+        shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::Expected a stable semver tag such as v1.2.3; got '$TAG'."
+            exit 1
+          fi
+
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Set up GPG signing key
+        shell: bash
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.HCP_PROVIDER_GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.HCP_PROVIDER_GPG_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+
+          test -n "$GPG_PRIVATE_KEY" || {
+            echo "::error::Missing HCP_PROVIDER_GPG_PRIVATE_KEY secret."
+            exit 1
+          }
+
+          printf '%s' "$GPG_PRIVATE_KEY" |
+            gpg --batch --import
+
+          KEY_ID="$(
+            gpg --batch --with-colons --list-secret-keys |
+              awk -F: '$1 == "fpr" { print $10; exit }'
+          )"
+
+          test -n "$KEY_ID" || {
+            echo "::error::Could not identify the imported GPG key."
+            exit 1
+          }
+
+          echo "GPG_KEY_ID=$KEY_ID" >> "$GITHUB_ENV"
+
+      - name: Build Linux AMD64 provider
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p dist
+
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+            go build \
+              -trimpath \
+              -ldflags="-s -w" \
+              -o "dist/terraform-provider-${PROVIDER_NAME}_v${VERSION}" \
+              .
+
+          file "dist/terraform-provider-${PROVIDER_NAME}_v${VERSION}"
+
+      - name: Package provider and sign checksums
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          GPG_PASSPHRASE: ${{ secrets.HCP_PROVIDER_GPG_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+
+          cd dist
+
+          BINARY="terraform-provider-${PROVIDER_NAME}_v${VERSION}"
+          PACKAGE="terraform-provider-${PROVIDER_NAME}_${VERSION}_linux_amd64.zip"
+
+          zip "$PACKAGE" "$BINARY"
+          sha256sum "$PACKAGE" > SHA256SUMS
+
+          gpg --batch \
+            --yes \
+            --pinentry-mode loopback \
+            --passphrase "$GPG_PASSPHRASE" \
+            --detach-sign \
+            --output SHA256SUMS.sig \
+            SHA256SUMS
+
+          cat SHA256SUMS
+
+      - name: Check registry version and publish
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          TF_TOKEN: ${{ secrets.TF_TOKEN_APP_TERRAFORM_IO }}
+        run: |
+          set -euo pipefail
+
+          test -n "$TF_TOKEN" || {
+            echo "::error::Missing TF_TOKEN_APP_TERRAFORM_IO secret."
+            exit 1
+          }
+
+          API="https://app.terraform.io/api/v2"
+          BASE="$API/organizations/$TF_ORG/registry-providers/private/$TF_ORG/$PROVIDER_NAME"
+
+          api() {
+            curl --silent --show-error --fail-with-body \
+              --header "Authorization: Bearer $TF_TOKEN" \
+              --header "Content-Type: application/vnd.api+json" \
+              "$@"
+          }
+
+          # Require the provider record to exist. Do not silently create
+          # or publish into an unintended namespace.
+          api "$BASE" >/dev/null || {
+            echo "::error::Provider $TF_ORG/$PROVIDER_NAME is not registered in the private registry."
+            exit 1
+          }
+
+          # Explicitly reject duplicate versions before creating anything.
+          if api "$BASE/versions/$VERSION" >/dev/null 2>&1; then
+            echo "::error::Version $VERSION already exists in $TF_ORG/$PROVIDER_NAME. Refusing to overwrite it."
+            exit 1
+          fi
+
+          echo "Creating $TF_ORG/$PROVIDER_NAME version $VERSION"
+
+          VERSION_RESPONSE="$(
+            api --request POST \
+              --data "$(
+                jq -n \
+                  --arg version "$VERSION" \
+                  --arg key "$GPG_KEY_ID" \
+                  '{
+                    data: {
+                      type: "registry-provider-versions",
+                      attributes: {
+                        version: $version,
+                        "key-id": $key,
+                        protocols: ["5.0", "6.0"]
+                      }
+                    }
+                  }'
+              )" \
+              "$BASE/versions"
+          )"
+
+          SHASUMS_URL="$(jq -er '.data.links["shasums-upload"]' <<< "$VERSION_RESPONSE")"
+          SIGNATURE_URL="$(jq -er '.data.links["shasums-sig-upload"]' <<< "$VERSION_RESPONSE")"
+
+          # Upload the signed checksum manifest.
+          curl --silent --show-error --fail-with-body \
+            --request PUT \
+            --upload-file dist/SHA256SUMS \
+            "$SHASUMS_URL"
+
+          curl --silent --show-error --fail-with-body \
+            --request PUT \
+            --upload-file dist/SHA256SUMS.sig \
+            "$SIGNATURE_URL"
+
+          PACKAGE="terraform-provider-${PROVIDER_NAME}_${VERSION}_linux_amd64.zip"
+          SHASUM="$(awk '{print $1}' "dist/SHA256SUMS")"
+
+          PLATFORM_RESPONSE="$(
+            api --request POST \
+              --data "$(
+                jq -n \
+                  --arg checksum "$SHASUM" \
+                  --arg filename "$PACKAGE" \
+                  '{
+                    data: {
+                      type: "registry-provider-platforms",
+                      attributes: {
+                        os: "linux",
+                        arch: "amd64",
+                        shasum: $checksum,
+                        filename: $filename
+                      }
+                    }
+                  }'
+              )" \
+              "$BASE/versions/$VERSION/platforms"
+          )"
+
+          BINARY_URL="$(jq -er '.data.links["provider-binary-upload"]' <<< "$PLATFORM_RESPONSE")"
+
+          curl --silent --show-error --fail-with-body \
+            --request PUT \
+            --upload-file "dist/$PACKAGE" \
+            "$BINARY_URL"
+
+          echo "Published $TF_ORG/$PROVIDER_NAME v$VERSION (linux_amd64)."
+
+      - name: Verify published platform
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          TF_TOKEN: ${{ secrets.TF_TOKEN_APP_TERRAFORM_IO }}
+        run: |
+          set -euo pipefail
+
+          URL="https://app.terraform.io/api/v2/organizations/$TF_ORG/registry-providers/private/$TF_ORG/$PROVIDER_NAME/versions/$VERSION/platforms/linux/amd64"
+
+          RESPONSE="$(
+            curl --silent --show-error --fail-with-body \
+              --header "Authorization: Bearer $TF_TOKEN" \
+              --header "Content-Type: application/vnd.api+json" \
+              "$URL"
+          )"
+
+          echo "$RESPONSE" | jq '{
+            version: .data.attributes.version,
+            os: .data.attributes.os,
+            arch: .data.attributes.arch,
+            filename: .data.attributes.filename,
+            provider_binary_uploaded: .data.attributes["provider-binary-uploaded"]
+          }'
+
+          test "$(jq -r '.data.attributes["provider-binary-uploaded"]' <<< "$RESPONSE")" = "true" || {
+            echo "::error::Registry did not confirm the provider binary upload."
+            exit 1
+          }
