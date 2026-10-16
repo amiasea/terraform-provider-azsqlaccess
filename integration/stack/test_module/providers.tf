@@ -8,8 +8,8 @@ terraform {
     }
 
     mssql = {
-      source  = "amiasea-development/azsqlaccess"
-      version = "1.0.0"
+      source  = "app.terraform.io/amiasea-development/azsqlaccess"
+      version = "1.0.1"
     }
   }
 }

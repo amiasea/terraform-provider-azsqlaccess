@@ -58,24 +58,22 @@ jobs:
             exit 1
           fi
 
-          printf '%s' "$GPG_PRIVATE_KEY" |
-            gpg --batch --import
+          printf '%s' "$GPG_PRIVATE_KEY" | gpg --batch --import
 
-          # HCP Terraform expects the registered key ID, not its full fingerprint.
           GPG_KEY_ID="$(
             gpg --batch --with-colons --list-secret-keys |
               awk -F: '$1 == "sec" { print $5; exit }'
           )"
 
           if [[ "$GPG_KEY_ID" != "FA67D7FC943D1A35" ]]; then
-            echo "::error::Imported GPG key ID '$GPG_KEY_ID' does not match the registered key FA67D7FC943D1A35."
+            echo "::error::Imported GPG key ID '$GPG_KEY_ID' does not match registered key FA67D7FC943D1A35."
             exit 1
           fi
 
           echo "GPG_KEY_ID=$GPG_KEY_ID" >> "$GITHUB_ENV"
           echo "Imported registered GPG signing key."
 
-      - name: Build Linux AMD64 provider
+      - name: Build provider for all platforms
         shell: bash
         env:
           VERSION: ${{ steps.version.outputs.version }}
@@ -84,16 +82,30 @@ jobs:
 
           mkdir -p dist
 
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
-            go build \
-              -trimpath \
-              -ldflags="-s -w" \
-              -o "dist/terraform-provider-${PROVIDER_NAME}_v${VERSION}" \
-              .
+          for PLATFORM in linux_amd64 linux_arm64 windows_amd64; do
+            OS="${PLATFORM%_*}"
+            ARCH="${PLATFORM#*_}"
+            EXT=""
 
-          file "dist/terraform-provider-${PROVIDER_NAME}_v${VERSION}"
+            if [[ "$OS" == "windows" ]]; then
+              EXT=".exe"
+            fi
 
-      - name: Package provider and sign checksums
+            BINARY="terraform-provider-${PROVIDER_NAME}_v${VERSION}${EXT}"
+
+            echo "Building ${OS}/${ARCH}..."
+
+            CGO_ENABLED=0 GOOS="$OS" GOARCH="$ARCH" \
+              go build \
+                -trimpath \
+                -ldflags="-s -w" \
+                -o "dist/$BINARY" \
+                .
+
+            file "dist/$BINARY"
+          done
+
+      - name: Package platforms and sign checksums
         shell: bash
         env:
           VERSION: ${{ steps.version.outputs.version }}
@@ -101,27 +113,43 @@ jobs:
         run: |
           set -euo pipefail
 
-          PACKAGE="terraform-provider-${PROVIDER_NAME}_${VERSION}_linux_amd64.zip"
-          BINARY="terraform-provider-${PROVIDER_NAME}_v${VERSION}"
+          if [[ -z "$GPG_PASSPHRASE" ]]; then
+            echo "::error::Missing HCP_PROVIDER_GPG_PASSPHRASE repository secret."
+            exit 1
+          fi
 
-          (
-            cd dist
+          cd dist
+          : > SHA256SUMS
 
+          for PLATFORM in linux_amd64 linux_arm64 windows_amd64; do
+            OS="${PLATFORM%_*}"
+            ARCH="${PLATFORM#*_}"
+            EXT=""
+
+            if [[ "$OS" == "windows" ]]; then
+              EXT=".exe"
+            fi
+
+            BINARY="terraform-provider-${PROVIDER_NAME}_v${VERSION}${EXT}"
+            PACKAGE="terraform-provider-${PROVIDER_NAME}_${VERSION}_${OS}_${ARCH}.zip"
+
+            echo "Packaging $PACKAGE"
             zip "$PACKAGE" "$BINARY"
-            sha256sum "$PACKAGE" > SHA256SUMS
 
-            gpg --batch \
-              --yes \
-              --pinentry-mode loopback \
-              --passphrase "$GPG_PASSPHRASE" \
-              --local-user "$GPG_KEY_ID" \
-              --detach-sign \
-              --output SHA256SUMS.sig \
-              SHA256SUMS
+            sha256sum "$PACKAGE" >> SHA256SUMS
+          done
 
-            echo "Generated package and signed checksum manifest:"
-            cat SHA256SUMS
-          )
+          gpg --batch \
+            --yes \
+            --pinentry-mode loopback \
+            --passphrase "$GPG_PASSPHRASE" \
+            --local-user "$GPG_KEY_ID" \
+            --detach-sign \
+            --output SHA256SUMS.sig \
+            SHA256SUMS
+
+          echo "Generated signed checksum manifest:"
+          cat SHA256SUMS
 
       - name: Register provider and publish version
         shell: bash
@@ -211,7 +239,7 @@ jobs:
             jq -er '.data.links["shasums-sig-upload"]' <<< "$VERSION_RESPONSE"
           )"
 
-          # Upload the checksum manifest and its GPG signature.
+          # Upload the complete manifest and its signature before registering platforms.
           curl --silent --show-error --fail-with-body \
             --request PUT \
             --upload-file dist/SHA256SUMS \
@@ -222,45 +250,62 @@ jobs:
             --upload-file dist/SHA256SUMS.sig \
             "$SIGNATURE_URL"
 
-          PACKAGE="terraform-provider-${PROVIDER_NAME}_${VERSION}_linux_amd64.zip"
-          SHASUM="$(awk '{print $1}' dist/SHA256SUMS)"
+          # Register and upload every platform against this version.
+          for PLATFORM in linux_amd64 linux_arm64 windows_amd64; do
+            OS="${PLATFORM%_*}"
+            ARCH="${PLATFORM#*_}"
+            PACKAGE="terraform-provider-${PROVIDER_NAME}_${VERSION}_${OS}_${ARCH}.zip"
 
-          # Register the Linux AMD64 platform.
-          PLATFORM_RESPONSE="$(
-            api --request POST \
-              --data "$(
-                jq -n \
-                  --arg checksum "$SHASUM" \
-                  --arg filename "$PACKAGE" \
-                  '{
-                    data: {
-                      type: "registry-provider-platforms",
-                      attributes: {
-                        os: "linux",
-                        arch: "amd64",
-                        shasum: $checksum,
-                        filename: $filename
+            SHASUM="$(
+              awk -v package="$PACKAGE" '$2 == package { print $1 }' dist/SHA256SUMS
+            )"
+
+            if [[ -z "$SHASUM" ]]; then
+              echo "::error::No checksum found for $PACKAGE."
+              exit 1
+            fi
+
+            echo "Registering platform ${OS}/${ARCH}..."
+
+            PLATFORM_RESPONSE="$(
+              api --request POST \
+                --data "$(
+                  jq -n \
+                    --arg os "$OS" \
+                    --arg arch "$ARCH" \
+                    --arg checksum "$SHASUM" \
+                    --arg filename "$PACKAGE" \
+                    '{
+                      data: {
+                        type: "registry-provider-platforms",
+                        attributes: {
+                          os: $os,
+                          arch: $arch,
+                          shasum: $checksum,
+                          filename: $filename
+                        }
                       }
-                    }
-                  }'
-              )" \
-              "$BASE/versions/$VERSION/platforms"
-          )"
+                    }'
+                )" \
+                "$BASE/versions/$VERSION/platforms"
+            )"
 
-          BINARY_URL="$(
-            jq -er '.data.links["provider-binary-upload"]' \
-              <<< "$PLATFORM_RESPONSE"
-          )"
+            BINARY_URL="$(
+              jq -er '.data.links["provider-binary-upload"]' \
+                <<< "$PLATFORM_RESPONSE"
+            )"
 
-          # Upload the provider archive.
-          curl --silent --show-error --fail-with-body \
-            --request PUT \
-            --upload-file "dist/$PACKAGE" \
-            "$BINARY_URL"
+            curl --silent --show-error --fail-with-body \
+              --request PUT \
+              --upload-file "dist/$PACKAGE" \
+              "$BINARY_URL"
 
-          echo "Uploaded $TF_ORG/$PROVIDER_NAME v$VERSION (linux_amd64)."
+            echo "Uploaded $PACKAGE"
+          done
 
-      - name: Verify published platform
+          echo "Published $TF_ORG/$PROVIDER_NAME v$VERSION for all three platforms."
+
+      - name: Verify published platforms
         shell: bash
         env:
           VERSION: ${{ steps.version.outputs.version }}
@@ -268,25 +313,33 @@ jobs:
         run: |
           set -euo pipefail
 
-          URL="https://app.terraform.io/api/v2/organizations/$TF_ORG/registry-providers/private/$TF_ORG/$PROVIDER_NAME/versions/$VERSION/platforms/linux/amd64"
+          BASE="https://app.terraform.io/api/v2/organizations/$TF_ORG/registry-providers/private/$TF_ORG/$PROVIDER_NAME/versions/$VERSION"
 
-          RESPONSE="$(
-            curl --silent --show-error --fail-with-body \
-              --header "Authorization: Bearer $TF_TOKEN" \
-              --header "Content-Type: application/vnd.api+json" \
-              "$URL"
-          )"
+          for PLATFORM in linux_amd64 linux_arm64 windows_amd64; do
+            OS="${PLATFORM%_*}"
+            ARCH="${PLATFORM#*_}"
+            URL="$BASE/platforms/$OS/$ARCH"
 
-          jq '{
-            os: .data.attributes.os,
-            arch: .data.attributes.arch,
-            filename: .data.attributes.filename,
-            provider_binary_uploaded: .data.attributes["provider-binary-uploaded"]
-          }' <<< "$RESPONSE"
+            echo "Verifying ${OS}/${ARCH}..."
 
-          if [[ "$(jq -r '.data.attributes["provider-binary-uploaded"]' <<< "$RESPONSE")" != "true" ]]; then
-            echo "::error::HCP Terraform did not confirm the provider binary upload."
-            exit 1
-          fi
+            RESPONSE="$(
+              curl --silent --show-error --fail-with-body \
+                --header "Authorization: Bearer $TF_TOKEN" \
+                --header "Content-Type: application/vnd.api+json" \
+                "$URL"
+            )"
 
-          echo "Verified published provider $TF_ORG/$PROVIDER_NAME v$VERSION."
+            jq '{
+              os: .data.attributes.os,
+              arch: .data.attributes.arch,
+              filename: .data.attributes.filename,
+              provider_binary_uploaded: .data.attributes["provider-binary-uploaded"]
+            }' <<< "$RESPONSE"
+
+            if [[ "$(jq -r '.data.attributes["provider-binary-uploaded"]' <<< "$RESPONSE")" != "true" ]]; then
+              echo "::error::HCP Terraform did not confirm the ${OS}/${ARCH} provider binary upload."
+              exit 1
+            fi
+          done
+
+          echo "Verified all published platforms for $TF_ORG/$PROVIDER_NAME v$VERSION."
