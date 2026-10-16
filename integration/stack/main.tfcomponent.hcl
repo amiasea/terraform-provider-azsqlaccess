@@ -9,6 +9,6 @@ component "test_module" {
 
   providers = {
     azuread = provider.azuread.this
-    mssql   = provider.azsqlaccess.this
+    azsqlaccess   = provider.azsqlaccess.this
   }
 }

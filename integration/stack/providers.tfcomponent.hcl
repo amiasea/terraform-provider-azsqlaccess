@@ -22,12 +22,12 @@ provider "azuread" "this" {
 }
 
 provider "azsqlaccess" "this" {
-  engine = "mssql"
+  config {
+    engine = "mssql"
 
-  tenant_id = var.azure_tenant_id
-  client_id = var.azure_client_id
+    tenant_id = var.azure_tenant_id
+    client_id = var.azure_client_id
 
-  oidc_token = var.azure_identity_token
-
-  azure_auth {}
+    oidc_token = var.azure_identity_token
+  }
 }
