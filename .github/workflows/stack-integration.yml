@@ -1,4 +1,3 @@
-
 name: Stack Integration
 
 on:
@@ -9,7 +8,6 @@ on:
     paths:
       - ".github/workflows/stack-integration.yml"
       - "integration/stack/**"
-      - "dev.tfrc"
       - ".terraform-version"
       - "**/*.go"
       - "go.mod"
@@ -20,7 +18,6 @@ permissions:
 
 env:
   TF_TOKEN_app_terraform_io: ${{ secrets.TF_TOKEN_APP_TERRAFORM_IO }}
-  TF_CLI_CONFIG_FILE: ${{ github.workspace }}/dev.tfrc
   TFC_AGENT_TOKEN: ${{ secrets.TFC_AGENT_TOKEN }}
   TFC_ORGANIZATION: amiasea-development
   TFC_PROJECT_NAME: github-actions-integration
@@ -44,10 +41,7 @@ jobs:
         image: hashicorp/tfc-agent:latest
         env:
           TFC_AGENT_TOKEN: ${{ secrets.TFC_AGENT_TOKEN }}
-          TF_CLI_CONFIG_FILE: /workspace/dev.tfrc
           TF_TOKEN_app_terraform_io: ${{ secrets.TF_TOKEN_APP_TERRAFORM_IO }}
-        volumes:
-          - ${{ github.workspace }}:/workspace
 
     steps:
       - name: Checkout
@@ -72,21 +66,11 @@ jobs:
           terraform version
           terraform version | grep -F 'Terraform v1.16.2'
 
-      - name: Build provider
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p dist
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
-            go build -o dist/terraform-provider-azsqlaccess .
-
       - name: Validate workflow inputs
         shell: bash
         run: |
           set -euo pipefail
 
-          test -x dist/terraform-provider-azsqlaccess
-          test -f dev.tfrc
           test -f .terraform-version
           test -f integration/stack/main.tfdeploy.hcl
 
