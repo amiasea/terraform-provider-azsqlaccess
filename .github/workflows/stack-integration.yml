@@ -59,6 +59,19 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      - name: Set up Terraform CLI
+        uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: "1.16.2"
+          cli_config_credentials_token: ${{ secrets.TF_TOKEN_APP_TERRAFORM_IO }}
+
+      - name: Verify Terraform version
+        shell: bash
+        run: |
+          set -euo pipefail
+          terraform version
+          terraform version | grep -F 'Terraform v1.16.2'
+
       - name: Build provider
         shell: bash
         run: |
@@ -67,15 +80,25 @@ jobs:
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
             go build -o dist/terraform-provider-azsqlaccess .
 
-      - name: Validate configuration and inputs
+      - name: Validate workflow inputs
         shell: bash
         run: |
           set -euo pipefail
 
           test -x dist/terraform-provider-azsqlaccess
           test -f dev.tfrc
+          test -f .terraform-version
           test -f integration/stack/main.tfdeploy.hcl
 
+          configured_version="$(tr -d '[:space:]' < .terraform-version)"
+          if [[ "$configured_version" != "1.16.2" ]]; then
+            echo "::error::.terraform-version must contain 1.16.2; found ${configured_version}"
+            exit 1
+          fi
+
+          : "${TF_TOKEN_app_terraform_io:?Missing HCP Terraform API token}"
+          : "${TFC_AGENT_TOKEN:?Missing HCP Terraform agent token}"
+          : "${TFC_AGENT_POOL_ID:?Missing HCP Terraform agent pool ID}"
           : "${AZURE_TENANT_ID:?Missing repository variable AZURE_TENANT_ID}"
           : "${AZURE_CLIENT_ID:?Missing repository variable AZURE_CLIENT_ID}"
           : "${AZURE_SUBSCRIPTION_ID:?Missing repository variable AZURE_SUBSCRIPTION_ID}"
@@ -140,7 +163,6 @@ jobs:
 
             if [[ "$status" -lt 200 || "$status" -ge 300 ]]; then
               echo "::error::HCP API request failed: ${method} ${url}" >&2
-              echo "Response body:" >&2
               cat "$response_file" >&2
               rm -f "$response_file"
               echo "::endgroup::" >&2
@@ -163,8 +185,6 @@ jobs:
             <<< "$projects")"
 
           if [[ -z "$project_id" ]]; then
-            echo "Project not found; creating: ${TFC_PROJECT_NAME}"
-
             project_payload="$(jq -n \
               --arg name "$TFC_PROJECT_NAME" \
               '{
@@ -190,7 +210,7 @@ jobs:
           test "$project_id" != "null"
           echo "Project ID: ${project_id}"
 
-          echo "Upsert stage: list Stacks and find target Stack"
+          echo "Upsert stage: find or create Stack"
 
           stacks="$(api \
             "${TFC_API}/organizations/${TFC_ORGANIZATION}/stacks?page%5Bsize%5D=100")"
@@ -202,8 +222,6 @@ jobs:
               | select(.attributes.name == $name)
               | select(.relationships.project.data.id == $project)
               | .id][0] // empty' <<< "$stacks")"
-
-          echo "Upsert stage: prepare Stack payload"
 
           stack_payload="$(jq -n \
             --arg name "$TFC_STACK_NAME" \
@@ -235,16 +253,12 @@ jobs:
             }')"
 
           if [[ -z "$stack_id" ]]; then
-            echo "Upsert stage: create Stack"
-
             stack="$(api --request POST \
               --data "$stack_payload" \
               "${TFC_API}/stacks")"
 
             stack_id="$(jq -r '.data.id // empty' <<< "$stack")"
           else
-            echo "Upsert stage: update Stack ${stack_id}"
-
             api --request PATCH \
               --data "$stack_payload" \
               "${TFC_API}/stacks/${stack_id}" >/dev/null
@@ -256,7 +270,6 @@ jobs:
 
           echo "Upsert stage: find or create Project variable set"
 
-          # First search variable sets already associated with the Project.
           project_varsets="$(api \
             "${TFC_API}/projects/${project_id}/varsets?page%5Bsize%5D=100")"
 
@@ -266,13 +279,7 @@ jobs:
               | select(.attributes.name == $name)
               | .id][0] // empty' <<< "$project_varsets")"
 
-          if [[ -n "$varset_id" ]]; then
-            echo "Found Project variable set: ${TFC_VARSET_NAME}"
-            echo "Variable set ID: ${varset_id}"
-          else
-            echo "No matching Project variable set found."
-            echo "Upsert stage: search organization variable sets"
-
+          if [[ -z "$varset_id" ]]; then
             org_varsets="$(api \
               "${TFC_API}/organizations/${TFC_ORGANIZATION}/varsets?page%5Bsize%5D=100")"
 
@@ -283,16 +290,10 @@ jobs:
                 | .id][0] // empty' <<< "$org_varsets")"
 
             if [[ -n "$varset_id" ]]; then
-              echo "Found existing organization variable set: ${TFC_VARSET_NAME}"
-              echo "Variable set ID: ${varset_id}"
-              echo "Upsert stage: associate variable set with Project"
-
               association_payload="$(jq -n \
                 --arg project "$project_id" \
                 '{
-                  data: [
-                    {type: "projects", id: $project}
-                  ]
+                  data: [{type: "projects", id: $project}]
                 }')"
 
               api --request POST \
@@ -300,9 +301,6 @@ jobs:
                 "${TFC_API}/varsets/${varset_id}/relationships/projects" \
                 >/dev/null
             else
-              echo "No organization-level variable set found."
-              echo "Upsert stage: create variable set"
-
               varset_payload="$(jq -n \
                 --arg name "$TFC_VARSET_NAME" \
                 --arg project "$project_id" \
@@ -335,8 +333,6 @@ jobs:
           test "$varset_id" != "null"
           echo "Variable set ID: ${varset_id}"
 
-          echo "Upsert stage: synchronize variable-set variables"
-
           sync_var() {
             local key="$1"
             local value="$2"
@@ -344,7 +340,6 @@ jobs:
             local var_id
             local payload
 
-            # Refresh the variable list before each reconciliation.
             vars_response="$(api \
               "${TFC_API}/varsets/${varset_id}/relationships/vars?page%5Bsize%5D=100")"
 
@@ -375,14 +370,12 @@ jobs:
                 --data "$payload" \
                 "${TFC_API}/varsets/${varset_id}/relationships/vars/${var_id}" \
                 >/dev/null
-
               echo "Updated variable: ${key}"
             else
               api --request POST \
                 --data "$payload" \
                 "${TFC_API}/varsets/${varset_id}/relationships/vars" \
                 >/dev/null
-
               echo "Created variable: ${key}"
             fi
           }
@@ -394,10 +387,6 @@ jobs:
           sync_var azure_database_name "$AZURE_DATABASE_NAME"
           sync_var entra_group_display_name "$ENTRA_GROUP_DISPLAY_NAME"
 
-          echo "Project ID: ${project_id}"
-          echo "Stack ID: ${stack_id}"
-          echo "Variable set ID: ${varset_id}"
-
           echo "TFC_PROJECT_ID=${project_id}" >> "$GITHUB_ENV"
           echo "TFC_STACK_ID=${stack_id}" >> "$GITHUB_ENV"
           echo "TFC_VARSET_ID=${varset_id}" >> "$GITHUB_ENV"
@@ -406,13 +395,38 @@ jobs:
           echo "stack_url=${stack_url}" >> "$GITHUB_OUTPUT"
           echo "Stack URL: ${stack_url}"
 
-      - name: Set up Terraform CLI
-        uses: hashicorp/setup-terraform@v3
-        with:
-          terraform_version: "1.15.3"
-          cli_config_credentials_token: ${{ secrets.TF_TOKEN_APP_TERRAFORM_IO }}
+      - name: Initialize Stack configuration
+        working-directory: integration/stack
+        shell: bash
+        run: |
+          set -euo pipefail
 
-      - name: Upload Stack configuration with Terraform Stacks CLI
+          echo "Terraform version:"
+          terraform version
+
+          echo "Initializing Stack configuration and downloading dependencies..."
+          terraform stacks init
+
+          echo "Initialization completed."
+          echo "Stack dependency directory:"
+          if [[ -d .terraform/modules ]]; then
+            find .terraform/modules -maxdepth 2 -type d -print
+          else
+            echo "No .terraform/modules directory was created."
+          fi
+
+      - name: Validate Stack configuration
+        working-directory: integration/stack
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Validating Stack configuration..."
+          terraform stacks validate
+
+          echo "Stack configuration validation succeeded."
+
+      - name: Upload Stack configuration
         working-directory: integration/stack
         shell: bash
         run: |
@@ -421,10 +435,10 @@ jobs:
           : "${TFC_STACK_ID:?Missing Stack ID from upsert step}"
           : "${TF_TOKEN_app_terraform_io:?Missing HCP Terraform API token}"
 
-          echo "Terraform CLI version:"
+          echo "Terraform version:"
           terraform version
 
-          echo "Uploading Stack configuration"
+          echo "Uploading validated Stack configuration"
           echo "Organization: ${TFC_ORGANIZATION}"
           echo "Project: ${TFC_PROJECT_NAME}"
           echo "Stack: ${TFC_STACK_NAME}"
