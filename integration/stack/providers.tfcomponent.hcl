@@ -4,7 +4,7 @@ required_providers {
     version = "~> 3.10"
   }
 
-  mssql = {
+  azsqlaccess = {
     source  = "app.terraform.io/amiasea-development/azsqlaccess"
     version = "1.0.2"
   }
@@ -21,8 +21,13 @@ provider "azuread" "this" {
   }
 }
 
-provider "mssql" "this" {
-  hostname = var.azure_database_host
+provider "azsqlaccess" "this" {
+  engine = "mssql"
+
+  tenant_id = var.azure_tenant_id
+  client_id = var.azure_client_id
+
+  oidc_token = var.azure_identity_token
 
   azure_auth {}
 }

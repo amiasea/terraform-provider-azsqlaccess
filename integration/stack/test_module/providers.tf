@@ -7,7 +7,7 @@ terraform {
       version = "~> 3.10"
     }
 
-    mssql = {
+    azsqlaccess = {
       source  = "app.terraform.io/amiasea-development/azsqlaccess"
       version = "1.0.2"
     }
