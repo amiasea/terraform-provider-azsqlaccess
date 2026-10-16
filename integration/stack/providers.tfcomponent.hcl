@@ -6,7 +6,7 @@ required_providers {
 
   mssql = {
     source  = "app.terraform.io/amiasea-development/azsqlaccess"
-    version = "1.0.1"
+    version = "1.0.2"
   }
 }
 
