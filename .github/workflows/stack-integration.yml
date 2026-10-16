@@ -84,9 +84,10 @@ jobs:
           : "${AZURE_DATABASE_NAME:?Missing repository variable AZURE_DATABASE_NAME}"
           : "${ENTRA_GROUP_DISPLAY_NAME:?Missing repository variable ENTRA_GROUP_DISPLAY_NAME}"
 
-
       - name: Install API tools
+        shell: bash
         run: |
+          set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y jq curl
 
@@ -113,7 +114,9 @@ jobs:
               if [[ "$previous" == "--request" ]]; then
                 method="$arg"
               elif [[ "$arg" == "--data" || "$arg" == "--data-raw" || "$arg" == "--data-binary" ]]; then
-                if [[ "$method" == "GET" ]]; then method="POST"; fi
+                if [[ "$method" == "GET" ]]; then
+                  method="POST"
+                fi
               fi
               previous="$arg"
             done
@@ -135,6 +138,7 @@ jobs:
             fi
 
             echo "HTTP status: ${status}" >&2
+
             if [[ "$status" -lt 200 || "$status" -ge 300 ]]; then
               echo "::error::HCP API request failed: ${method} ${url}" >&2
               echo "Response body:" >&2
@@ -150,12 +154,13 @@ jobs:
           }
 
           echo "Upsert stage: find or create Project"
+
           projects="$(api \
             "${TFC_API}/organizations/${TFC_ORGANIZATION}/projects?page%5Bsize%5D=100")"
 
           project_id="$(jq -r \
             --arg name "$TFC_PROJECT_NAME" \
-            '[.data[] | select(.attributes.name == $name) | .id][0] // empty' \
+            '[.data[]? | select(.attributes.name == $name) | .id][0] // empty' \
             <<< "$projects")"
 
           if [[ -z "$project_id" ]]; then
@@ -177,7 +182,7 @@ jobs:
               --data "$project_payload" \
               "${TFC_API}/organizations/${TFC_ORGANIZATION}/projects")"
 
-            project_id="$(jq -r '.data.id' <<< "$project")"
+            project_id="$(jq -r '.data.id // empty' <<< "$project")"
           else
             echo "Found Project: ${TFC_PROJECT_NAME}"
           fi
@@ -187,18 +192,20 @@ jobs:
           echo "Project ID: ${project_id}"
 
           echo "Upsert stage: list Stacks and find target Stack"
+
           stacks="$(api \
             "${TFC_API}/organizations/${TFC_ORGANIZATION}/stacks?page%5Bsize%5D=100")"
 
           stack_id="$(jq -r \
             --arg name "$TFC_STACK_NAME" \
             --arg project "$project_id" \
-            '[.data[]
+            '[.data[]?
               | select(.attributes.name == $name)
               | select(.relationships.project.data.id == $project)
               | .id][0] // empty' <<< "$stacks")"
 
           echo "Upsert stage: prepare Stack payload"
+
           stack_payload="$(jq -n \
             --arg name "$TFC_STACK_NAME" \
             --arg project "$project_id" \
@@ -206,6 +213,199 @@ jobs:
             '{
               data: {
                 type: "stacks",
+                attributes: {
+                  name: $name,
+                  description: "Custom azsqlaccess provider integration test",
+                  "execution-mode": "agent",
+                  "setting-overwrites": {
+                    "execution-mode": true,
+                    "agent-pool": true
+                  },
+                  "trigger-disabled": false,
+                  "speculative-enabled": false
+                },
+                relationships: {
+                  project: {
+                    data: {type: "projects", id: $project}
+                  },
+                  "agent-pool": {
+                    data: {type: "agent-pools", id: $pool}
+                  }
+                }
+              }
+            }')"
+
+          if [[ -z "$stack_id" ]]; then
+            echo "Upsert stage: create Stack"
+
+            stack="$(api --request POST \
+              --data "$stack_payload" \
+              "${TFC_API}/stacks")"
+
+            stack_id="$(jq -r '.data.id // empty' <<< "$stack")"
+          else
+            echo "Upsert stage: update Stack ${stack_id}"
+
+            api --request PATCH \
+              --data "$stack_payload" \
+              "${TFC_API}/stacks/${stack_id}" >/dev/null
+          fi
+
+          test -n "$stack_id"
+          test "$stack_id" != "null"
+          echo "Stack ID: ${stack_id}"
+
+          echo "Upsert stage: find or create Project variable set"
+
+          # First search variable sets already associated with the Project.
+          project_varsets="$(api \
+            "${TFC_API}/projects/${project_id}/varsets?page%5Bsize%5D=100")"
+
+          varset_id="$(jq -r \
+            --arg name "$TFC_VARSET_NAME" \
+            '[.data[]?
+              | select(.attributes.name == $name)
+              | .id][0] // empty' <<< "$project_varsets")"
+
+          if [[ -n "$varset_id" ]]; then
+            echo "Found Project variable set: ${TFC_VARSET_NAME}"
+            echo "Variable set ID: ${varset_id}"
+          else
+            echo "No matching Project variable set found."
+            echo "Upsert stage: search organization variable sets"
+
+            org_varsets="$(api \
+              "${TFC_API}/organizations/${TFC_ORGANIZATION}/varsets?page%5Bsize%5D=100")"
+
+            varset_id="$(jq -r \
+              --arg name "$TFC_VARSET_NAME" \
+              '[.data[]?
+                | select(.attributes.name == $name)
+                | .id][0] // empty' <<< "$org_varsets")"
+
+            if [[ -n "$varset_id" ]]; then
+              echo "Found existing organization variable set: ${TFC_VARSET_NAME}"
+              echo "Variable set ID: ${varset_id}"
+              echo "Upsert stage: associate variable set with Project"
+
+              association_payload="$(jq -n \
+                --arg project "$project_id" \
+                '{
+                  data: [
+                    {type: "projects", id: $project}
+                  ]
+                }')"
+
+              api --request POST \
+                --data "$association_payload" \
+                "${TFC_API}/varsets/${varset_id}/relationships/projects" \
+                >/dev/null
+            else
+              echo "No organization-level variable set found."
+              echo "Upsert stage: create variable set"
+
+              varset_payload="$(jq -n \
+                --arg name "$TFC_VARSET_NAME" \
+                --arg project "$project_id" \
+                '{
+                  data: {
+                    type: "varsets",
+                    attributes: {
+                      name: $name,
+                      description: "Repository variables for provider integration tests",
+                      global: false,
+                      priority: false
+                    },
+                    relationships: {
+                      parent: {
+                        data: {type: "projects", id: $project}
+                      }
+                    }
+                  }
+                }')"
+
+              varset="$(api --request POST \
+                --data "$varset_payload" \
+                "${TFC_API}/organizations/${TFC_ORGANIZATION}/varsets")"
+
+              varset_id="$(jq -r '.data.id // empty' <<< "$varset")"
+            fi
+          fi
+
+          test -n "$varset_id"
+          test "$varset_id" != "null"
+          echo "Variable set ID: ${varset_id}"
+
+          echo "Upsert stage: synchronize variable-set variables"
+
+          sync_var() {
+            local key="$1"
+            local value="$2"
+            local vars_response
+            local var_id
+            local payload
+
+            # Refresh the variable list before each reconciliation.
+            vars_response="$(api \
+              "${TFC_API}/varsets/${varset_id}/relationships/vars?page%5Bsize%5D=100")"
+
+            var_id="$(jq -r \
+              --arg key "$key" \
+              '[.data[]?
+                | select(.attributes.key == $key)
+                | .id][0] // empty' <<< "$vars_response")"
+
+            payload="$(jq -n \
+              --arg key "$key" \
+              --arg value "$value" \
+              '{
+                data: {
+                  type: "vars",
+                  attributes: {
+                    key: $key,
+                    value: $value,
+                    category: "terraform",
+                    hcl: false,
+                    sensitive: false
+                  }
+                }
+              }')"
+
+            if [[ -n "$var_id" ]]; then
+              api --request PATCH \
+                --data "$payload" \
+                "${TFC_API}/varsets/${varset_id}/relationships/vars/${var_id}" \
+                >/dev/null
+
+              echo "Updated variable: ${key}"
+            else
+              api --request POST \
+                --data "$payload" \
+                "${TFC_API}/varsets/${varset_id}/relationships/vars" \
+                >/dev/null
+
+              echo "Created variable: ${key}"
+            fi
+          }
+
+          sync_var azure_tenant_id "$AZURE_TENANT_ID"
+          sync_var azure_client_id "$AZURE_CLIENT_ID"
+          sync_var azure_subscription_id "$AZURE_SUBSCRIPTION_ID"
+          sync_var azure_database_host "$AZURE_DATABASE_HOST"
+          sync_var azure_database_name "$AZURE_DATABASE_NAME"
+          sync_var entra_group_display_name "$ENTRA_GROUP_DISPLAY_NAME"
+
+          echo "Project ID: ${project_id}"
+          echo "Stack ID: ${stack_id}"
+          echo "Variable set ID: ${varset_id}"
+
+          echo "TFC_PROJECT_ID=${project_id}" >> "$GITHUB_ENV"
+          echo "TFC_STACK_ID=${stack_id}" >> "$GITHUB_ENV"
+          echo "TFC_VARSET_ID=${varset_id}" >> "$GITHUB_ENV"
+
+          stack_url="https://app.terraform.io/app/${TFC_ORGANIZATION}/stacks/${stack_id}"
+          echo "stack_url=${stack_url}" >> "$GITHUB_OUTPUT"
+          echo "Stack URL: ${stack_url}"
 
       - name: Package Stack configuration
         shell: bash
@@ -226,6 +426,9 @@ jobs:
         run: |
           set -euo pipefail
 
+          : "${TF_TOKEN_app_terraform_io:?Missing HCP Terraform API token}"
+          : "${TFC_STACK_ID:?Missing Stack ID from upsert step}"
+
           api() {
             local method="GET"
             local arg=""
@@ -238,7 +441,9 @@ jobs:
               if [[ "$previous" == "--request" ]]; then
                 method="$arg"
               elif [[ "$arg" == "--data" || "$arg" == "--data-raw" || "$arg" == "--data-binary" ]]; then
-                if [[ "$method" == "GET" ]]; then method="POST"; fi
+                if [[ "$method" == "GET" ]]; then
+                  method="POST"
+                fi
               fi
               previous="$arg"
             done
@@ -260,6 +465,7 @@ jobs:
             fi
 
             echo "HTTP status: ${status}" >&2
+
             if [[ "$status" -lt 200 || "$status" -ge 300 ]]; then
               echo "::error::HCP API request failed: ${method} ${url}" >&2
               echo "Response body:" >&2
@@ -279,14 +485,14 @@ jobs:
             --data '{"data":{"attributes":{"speculative":false}}}' \
             "${TFC_API}/stacks/${TFC_STACK_ID}/stack-configurations?source=manual")"
 
-          configuration_id="$(jq -r '.data.id' <<< "$configuration")"
+          configuration_id="$(jq -r '.data.id // empty' <<< "$configuration")"
           test -n "$configuration_id"
           test "$configuration_id" != "null"
 
           upload="$(api \
             "${TFC_API}/stack-configurations/${configuration_id}/upload-url")"
 
-          upload_url="$(jq -r '.data."source-upload-url"' <<< "$upload")"
+          upload_url="$(jq -r '.data."source-upload-url" // empty' <<< "$upload")"
           test -n "$upload_url"
           test "$upload_url" != "null"
 
@@ -302,6 +508,7 @@ jobs:
             "$upload_url")"
 
           echo "Stack archive upload HTTP status: ${upload_status}"
+
           if [[ "$upload_status" -lt 200 || "$upload_status" -ge 300 ]]; then
             echo "::error::Stack archive upload failed with HTTP ${upload_status}"
             cat "$upload_response"
@@ -325,6 +532,8 @@ jobs:
             exit 0
           fi
 
+          : "${TF_TOKEN_app_terraform_io:?Missing HCP Terraform API token}"
+
           api() {
             local method="GET"
             local arg=""
@@ -337,7 +546,9 @@ jobs:
               if [[ "$previous" == "--request" ]]; then
                 method="$arg"
               elif [[ "$arg" == "--data" || "$arg" == "--data-raw" || "$arg" == "--data-binary" ]]; then
-                if [[ "$method" == "GET" ]]; then method="POST"; fi
+                if [[ "$method" == "GET" ]]; then
+                  method="POST"
+                fi
               fi
               previous="$arg"
             done
@@ -359,6 +570,7 @@ jobs:
             fi
 
             echo "HTTP status: ${status}" >&2
+
             if [[ "$status" -lt 200 || "$status" -ge 300 ]]; then
               echo "::error::HCP API request failed: ${method} ${url}" >&2
               echo "Response body:" >&2
@@ -374,6 +586,7 @@ jobs:
           }
 
           echo "=== Configuration details ==="
+
           api "${TFC_API}/stack-configurations/${CONFIGURATION_ID}" |
             jq '.data | {
               id,
@@ -386,6 +599,7 @@ jobs:
             }'
 
           echo "=== Configuration diagnostics ==="
+
           api "${TFC_API}/stack-configurations/${CONFIGURATION_ID}/stack-diagnostics" |
             jq '.data[]? | {
               severity: .attributes.severity,
@@ -404,6 +618,9 @@ jobs:
         run: |
           set -euo pipefail
 
+          : "${TF_TOKEN_app_terraform_io:?Missing HCP Terraform API token}"
+          : "${CONFIGURATION_ID:?Missing configuration ID from upload step}"
+
           api() {
             local method="GET"
             local arg=""
@@ -416,7 +633,9 @@ jobs:
               if [[ "$previous" == "--request" ]]; then
                 method="$arg"
               elif [[ "$arg" == "--data" || "$arg" == "--data-raw" || "$arg" == "--data-binary" ]]; then
-                if [[ "$method" == "GET" ]]; then method="POST"; fi
+                if [[ "$method" == "GET" ]]; then
+                  method="POST"
+                fi
               fi
               previous="$arg"
             done
@@ -438,6 +657,7 @@ jobs:
             fi
 
             echo "HTTP status: ${status}" >&2
+
             if [[ "$status" -lt 200 || "$status" -ge 300 ]]; then
               echo "::error::HCP API request failed: ${method} ${url}" >&2
               echo "Response body:" >&2
@@ -469,9 +689,11 @@ jobs:
 
             if [[ "$config_status" == "errored" || "$config_status" == "failed" ]]; then
               echo "::error::Stack configuration preparation failed."
+
               api "${TFC_API}/stack-configurations/${CONFIGURATION_ID}/stack-diagnostics" \
                 | jq -r '.data[]? | "\(.attributes.severity): \(.attributes.summary) - \(.attributes.detail)"' \
                 || true
+
               exit 1
             fi
 
@@ -489,7 +711,7 @@ jobs:
 
               echo "Deployment run statuses: ${statuses}"
 
-              # Every run must finish successfully.
+              # All returned deployment runs must have succeeded.
               if jq -e \
                 '(.data | length) > 0 and
                  all(.data[];
@@ -499,8 +721,7 @@ jobs:
                 exit 0
               fi
 
-              # These states indicate a run has terminated unsuccessfully
-              # or is waiting for an operator instead of completing on its own.
+              # Fail on terminal failures or operator-intervention states.
               if jq -e \
                 'any(.data[];
                   .attributes.status == "failed" or
