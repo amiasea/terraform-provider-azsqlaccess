@@ -3,7 +3,7 @@ name: Publish Provider
 on:
   push:
     tags:
-      - "v*.*.*"
+      - "provider-v*.*.*"
 
 permissions:
   contents: read
@@ -30,12 +30,13 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [[ ! "$TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
-            echo "::error::Expected a stable semantic version tag such as v1.2.3; got '$TAG'."
+          if [[ ! "$TAG" =~ ^provider-v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::Expected a tag such as provider-v1.2.3; got '$TAG'."
             exit 1
           fi
 
-          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+          # Strip the workflow-only prefix. The registry version remains X.Y.Z.
+          echo "version=${TAG#provider-v}" >> "$GITHUB_OUTPUT"
 
       - name: Check out source
         uses: actions/checkout@v4
