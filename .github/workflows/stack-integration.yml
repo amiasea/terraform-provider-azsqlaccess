@@ -9,6 +9,7 @@ on:
       - ".github/workflows/stack-integration.yml"
       - "integration/stack/**"
       - "dev.tfrc.json"
+      - ".terraform-version"
       - "**/*.go"
       - "go.mod"
       - "go.sum"
@@ -32,7 +33,6 @@ env:
   AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
   AZURE_DATABASE_HOST: ${{ vars.AZURE_DATABASE_HOST }}
   AZURE_DATABASE_NAME: ${{ vars.AZURE_DATABASE_NAME }}
-  DATABASE_ENGINE: ${{ vars.DATABASE_ENGINE }}
   ENTRA_GROUP_DISPLAY_NAME: ${{ vars.ENTRA_GROUP_DISPLAY_NAME }}
 
 jobs:
@@ -82,16 +82,8 @@ jobs:
           : "${AZURE_SUBSCRIPTION_ID:?Missing repository variable AZURE_SUBSCRIPTION_ID}"
           : "${AZURE_DATABASE_HOST:?Missing repository variable AZURE_DATABASE_HOST}"
           : "${AZURE_DATABASE_NAME:?Missing repository variable AZURE_DATABASE_NAME}"
-          : "${DATABASE_ENGINE:?Missing repository variable DATABASE_ENGINE}"
           : "${ENTRA_GROUP_DISPLAY_NAME:?Missing repository variable ENTRA_GROUP_DISPLAY_NAME}"
 
-          case "${DATABASE_ENGINE,,}" in
-            mssql|postgres|postgresql) ;;
-            *)
-              echo "::error::DATABASE_ENGINE must be mssql, postgres, or postgresql."
-              exit 1
-              ;;
-          esac
 
       - name: Install API tools
         run: |
@@ -110,12 +102,54 @@ jobs:
           : "${TFC_AGENT_POOL_ID:?Missing HCP Terraform agent pool ID}"
 
           api() {
-            curl --fail-with-body --silent --show-error \
+            local method="GET"
+            local arg=""
+            local previous=""
+            local url="${@: -1}"
+            local response_file
+            local status
+
+            for arg in "$@"; do
+              if [[ "$previous" == "--request" ]]; then
+                method="$arg"
+              elif [[ "$arg" == "--data" || "$arg" == "--data-raw" || "$arg" == "--data-binary" ]]; then
+                if [[ "$method" == "GET" ]]; then method="POST"; fi
+              fi
+              previous="$arg"
+            done
+
+            echo "::group::HCP API ${method} ${url}" >&2
+            response_file="$(mktemp)"
+
+            if ! status="$(curl --silent --show-error \
+              --output "$response_file" \
+              --write-out '%{http_code}' \
               --header "Authorization: Bearer ${TF_TOKEN_app_terraform_io}" \
               --header "Content-Type: application/vnd.api+json" \
-              "$@"
+              "$@")"; then
+              echo "::error::HCP API transport failure: ${method} ${url}" >&2
+              cat "$response_file" >&2 || true
+              rm -f "$response_file"
+              echo "::endgroup::" >&2
+              return 1
+            fi
+
+            echo "HTTP status: ${status}" >&2
+            if [[ "$status" -lt 200 || "$status" -ge 300 ]]; then
+              echo "::error::HCP API request failed: ${method} ${url}" >&2
+              echo "Response body:" >&2
+              cat "$response_file" >&2
+              rm -f "$response_file"
+              echo "::endgroup::" >&2
+              return 22
+            fi
+
+            cat "$response_file"
+            rm -f "$response_file"
+            echo "::endgroup::" >&2
           }
 
+          echo "Upsert stage: find or create Project"
           # Find or create the Project.
           projects="$(api \
             "${TFC_API}/organizations/${TFC_ORGANIZATION}/projects?page%5Bsize%5D=100")"
@@ -149,6 +183,7 @@ jobs:
           test "$project_id" != "null"
           echo "Project ID: ${project_id}"
 
+          echo "Upsert stage: list Stacks and find target Stack"
           # Find the Stack in this Project.
           stacks="$(api \
             "${TFC_API}/organizations/${TFC_ORGANIZATION}/stacks?page%5Bsize%5D=100")"
@@ -161,6 +196,7 @@ jobs:
               | select(.relationships.project.data.id == $project)
               | .id][0] // empty' <<< "$stacks")"
 
+          echo "Upsert stage: prepare Stack payload"
           # Explicitly assign the Stack to the configured agent pool.
           stack_payload="$(jq -n \
             --arg name "$TFC_STACK_NAME" \
@@ -192,11 +228,13 @@ jobs:
             }')"
 
           if [[ -z "$stack_id" ]]; then
+            echo "Upsert stage: create Stack"
             stack="$(api --request POST \
               --data "$stack_payload" \
               "${TFC_API}/stacks")"
             stack_id="$(jq -r '.data.id' <<< "$stack")"
           else
+            echo "Upsert stage: update Stack ${stack_id}"
             api --request PATCH \
               --data "$stack_payload" \
               "${TFC_API}/stacks/${stack_id}" >/dev/null
@@ -205,6 +243,7 @@ jobs:
           test -n "$stack_id"
           test "$stack_id" != "null"
 
+          echo "Upsert stage: find or create Project variable set"
           # Find or create a variable set owned by this Project.
           varsets="$(api \
             "${TFC_API}/projects/${project_id}/varsets?page%5Bsize%5D=100")"
@@ -218,6 +257,7 @@ jobs:
               | .id][0] // empty' <<< "$varsets")"
 
           if [[ -z "$varset_id" ]]; then
+            echo "Upsert stage: create variable set"
             varset_payload="$(jq -n \
               --arg name "$TFC_VARSET_NAME" \
               --arg project "$project_id" \
@@ -248,6 +288,7 @@ jobs:
           test -n "$varset_id"
           test "$varset_id" != "null"
 
+          echo "Upsert stage: synchronize variable-set variables"
           # Reconcile Terraform variables with GitHub repository variables.
           # Existing keys are updated; missing keys are added.
           vars_response="$(api \
@@ -300,7 +341,6 @@ jobs:
           sync_var azure_subscription_id "$AZURE_SUBSCRIPTION_ID"
           sync_var azure_database_host "$AZURE_DATABASE_HOST"
           sync_var azure_database_name "$AZURE_DATABASE_NAME"
-          sync_var database_engine "${DATABASE_ENGINE,,}"
           sync_var entra_group_display_name "$ENTRA_GROUP_DISPLAY_NAME"
 
           echo "Project ID: ${project_id}"
@@ -335,10 +375,51 @@ jobs:
           set -euo pipefail
 
           api() {
-            curl --fail-with-body --silent --show-error \
+            local method="GET"
+            local arg=""
+            local previous=""
+            local url="${@: -1}"
+            local response_file
+            local status
+
+            for arg in "$@"; do
+              if [[ "$previous" == "--request" ]]; then
+                method="$arg"
+              elif [[ "$arg" == "--data" || "$arg" == "--data-raw" || "$arg" == "--data-binary" ]]; then
+                if [[ "$method" == "GET" ]]; then method="POST"; fi
+              fi
+              previous="$arg"
+            done
+
+            echo "::group::HCP API ${method} ${url}" >&2
+            response_file="$(mktemp)"
+
+            if ! status="$(curl --silent --show-error \
+              --output "$response_file" \
+              --write-out '%{http_code}' \
               --header "Authorization: Bearer ${TF_TOKEN_app_terraform_io}" \
               --header "Content-Type: application/vnd.api+json" \
-              "$@"
+              "$@")"; then
+              echo "::error::HCP API transport failure: ${method} ${url}" >&2
+              cat "$response_file" >&2 || true
+              rm -f "$response_file"
+              echo "::endgroup::" >&2
+              return 1
+            fi
+
+            echo "HTTP status: ${status}" >&2
+            if [[ "$status" -lt 200 || "$status" -ge 300 ]]; then
+              echo "::error::HCP API request failed: ${method} ${url}" >&2
+              echo "Response body:" >&2
+              cat "$response_file" >&2
+              rm -f "$response_file"
+              echo "::endgroup::" >&2
+              return 22
+            fi
+
+            cat "$response_file"
+            rm -f "$response_file"
+            echo "::endgroup::" >&2
           }
 
           # Create a non-speculative configuration version.
@@ -359,11 +440,21 @@ jobs:
 
           # The temporary upload URL is a bearer capability.
           # Do not print it or send the HCP API token to this URL.
-          curl --fail-with-body --silent --show-error \
+          upload_response="$RUNNER_TEMP/stack-upload-response.txt"
+          upload_status="$(curl --silent --show-error \
+            --output "$upload_response" \
+            --write-out '%{http_code}' \
             --request PUT \
             --header "Content-Type: application/octet-stream" \
             --data-binary @"$RUNNER_TEMP/stack-configuration.tar.gz" \
-            "$upload_url"
+            "$upload_url")"
+
+          echo "Stack archive upload HTTP status: ${upload_status}"
+          if [[ "$upload_status" -lt 200 || "$upload_status" -ge 300 ]]; then
+            echo "::error::Stack archive upload failed with HTTP ${upload_status}"
+            cat "$upload_response"
+            exit 22
+          fi
 
           echo "Configuration uploaded: ${configuration_id}"
           echo "configuration_id=${configuration_id}" >> "$GITHUB_OUTPUT"
@@ -383,10 +474,51 @@ jobs:
           fi
 
           api() {
-            curl --fail-with-body --silent --show-error \
+            local method="GET"
+            local arg=""
+            local previous=""
+            local url="${@: -1}"
+            local response_file
+            local status
+
+            for arg in "$@"; do
+              if [[ "$previous" == "--request" ]]; then
+                method="$arg"
+              elif [[ "$arg" == "--data" || "$arg" == "--data-raw" || "$arg" == "--data-binary" ]]; then
+                if [[ "$method" == "GET" ]]; then method="POST"; fi
+              fi
+              previous="$arg"
+            done
+
+            echo "::group::HCP API ${method} ${url}" >&2
+            response_file="$(mktemp)"
+
+            if ! status="$(curl --silent --show-error \
+              --output "$response_file" \
+              --write-out '%{http_code}' \
               --header "Authorization: Bearer ${TF_TOKEN_app_terraform_io}" \
               --header "Content-Type: application/vnd.api+json" \
-              "$@"
+              "$@")"; then
+              echo "::error::HCP API transport failure: ${method} ${url}" >&2
+              cat "$response_file" >&2 || true
+              rm -f "$response_file"
+              echo "::endgroup::" >&2
+              return 1
+            fi
+
+            echo "HTTP status: ${status}" >&2
+            if [[ "$status" -lt 200 || "$status" -ge 300 ]]; then
+              echo "::error::HCP API request failed: ${method} ${url}" >&2
+              echo "Response body:" >&2
+              cat "$response_file" >&2
+              rm -f "$response_file"
+              echo "::endgroup::" >&2
+              return 22
+            fi
+
+            cat "$response_file"
+            rm -f "$response_file"
+            echo "::endgroup::" >&2
           }
 
           echo "=== Configuration details ==="
@@ -421,10 +553,51 @@ jobs:
           set -euo pipefail
 
           api() {
-            curl --fail-with-body --silent --show-error \
+            local method="GET"
+            local arg=""
+            local previous=""
+            local url="${@: -1}"
+            local response_file
+            local status
+
+            for arg in "$@"; do
+              if [[ "$previous" == "--request" ]]; then
+                method="$arg"
+              elif [[ "$arg" == "--data" || "$arg" == "--data-raw" || "$arg" == "--data-binary" ]]; then
+                if [[ "$method" == "GET" ]]; then method="POST"; fi
+              fi
+              previous="$arg"
+            done
+
+            echo "::group::HCP API ${method} ${url}" >&2
+            response_file="$(mktemp)"
+
+            if ! status="$(curl --silent --show-error \
+              --output "$response_file" \
+              --write-out '%{http_code}' \
               --header "Authorization: Bearer ${TF_TOKEN_app_terraform_io}" \
               --header "Content-Type: application/vnd.api+json" \
-              "$@"
+              "$@")"; then
+              echo "::error::HCP API transport failure: ${method} ${url}" >&2
+              cat "$response_file" >&2 || true
+              rm -f "$response_file"
+              echo "::endgroup::" >&2
+              return 1
+            fi
+
+            echo "HTTP status: ${status}" >&2
+            if [[ "$status" -lt 200 || "$status" -ge 300 ]]; then
+              echo "::error::HCP API request failed: ${method} ${url}" >&2
+              echo "Response body:" >&2
+              cat "$response_file" >&2
+              rm -f "$response_file"
+              echo "::endgroup::" >&2
+              return 22
+            fi
+
+            cat "$response_file"
+            rm -f "$response_file"
+            echo "::endgroup::" >&2
           }
 
           echo "Monitoring Stack: ${STACK_URL}"
