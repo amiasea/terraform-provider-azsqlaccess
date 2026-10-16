@@ -386,9 +386,11 @@ jobs:
 
           echo "Stack configuration validation succeeded."
 
-      - name: Upload Stack configuration
+      - name: Upload and watch Stack configuration
         working-directory: integration/stack
         shell: bash
+        env:
+          STACK_URL: ${{ steps.upsert.outputs.stack_url }}
         run: |
           set -euo pipefail
 
@@ -405,8 +407,28 @@ jobs:
           echo "Stack ID: ${TFC_STACK_ID}"
           echo "Configuration directory: ${PWD}"
 
-          terraform stacks configuration upload \
-            -stack-id "$TFC_STACK_ID"
+          upload_output="$(terraform stacks configuration upload \
+            -stack-id "$TFC_STACK_ID" 2>&1)" || {
+              printf '%s\n' "$upload_output"
+              exit 1
+            }
 
-          echo "Stack configuration upload command completed."
-          echo "Stack URL: ${{ steps.upsert.outputs.stack_url }}"
+          printf '%s\n' "$upload_output"
+
+          configuration_id="$(
+            printf '%s\n' "$upload_output" |
+              sed -nE "s/^[[:space:]]*Configuration ID:[[:space:]]*(stc-[[:alnum:]]+).*$/\1/p" |
+              tail -n 1
+          )"
+
+          if [[ -z "$configuration_id" ]]; then
+            echo "::error::Upload succeeded but no configuration ID was found in the CLI output."
+            exit 1
+          fi
+
+          echo "Configuration ID: $configuration_id"
+          echo "Stack URL: ${STACK_URL:-not provided}"
+
+          echo "Watching Stack configuration status..."
+          terraform stacks configuration watch \
+            -configuration-id "$configuration_id"
