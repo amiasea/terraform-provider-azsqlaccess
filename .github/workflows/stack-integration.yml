@@ -8,7 +8,7 @@ on:
     paths:
       - ".github/workflows/stack-integration.yml"
       - "integration/stack/**"
-      - "dev.tfrc.json"
+      - "dev.tfrc"
       - ".terraform-version"
       - "**/*.go"
       - "go.mod"
@@ -19,7 +19,7 @@ permissions:
 
 env:
   TF_TOKEN_app_terraform_io: ${{ secrets.TF_TOKEN_APP_TERRAFORM_IO }}
-  TF_CLI_CONFIG_FILE: ${{ github.workspace }}/dev.tfrc.json
+  TF_CLI_CONFIG_FILE: ${{ github.workspace }}/dev.tfrc
   TFC_AGENT_TOKEN: ${{ secrets.TFC_AGENT_TOKEN }}
 
   TFC_ORGANIZATION: amiasea-development
@@ -45,7 +45,7 @@ jobs:
         image: hashicorp/tfc-agent:latest
         env:
           TFC_AGENT_TOKEN: ${{ secrets.TFC_AGENT_TOKEN }}
-          TF_CLI_CONFIG_FILE: /workspace/dev.tfrc.json
+          TF_CLI_CONFIG_FILE: /workspace/dev.tfrc
           TF_TOKEN_app_terraform_io: ${{ secrets.TF_TOKEN_APP_TERRAFORM_IO }}
         volumes:
           - ${{ github.workspace }}:/workspace
@@ -74,7 +74,7 @@ jobs:
           set -euo pipefail
 
           test -x dist/terraform-provider-azsqlaccess
-          test -f dev.tfrc.json
+          test -f dev.tfrc
           test -f integration/stack/main.tfdeploy.hcl
 
           : "${AZURE_TENANT_ID:?Missing repository variable AZURE_TENANT_ID}"
