@@ -74,7 +74,7 @@ jobs:
           echo "GPG_KEY_ID=$GPG_KEY_ID" >> "$GITHUB_ENV"
           echo "Imported registered GPG signing key."
 
-      - name: Build provider for all platforms
+      - name: Build and package provider for all platforms
         shell: bash
         env:
           VERSION: ${{ steps.version.outputs.version }}
@@ -82,6 +82,8 @@ jobs:
           set -euo pipefail
 
           mkdir -p dist
+          rm -f dist/terraform-provider-azsqlaccess_*.zip
+          rm -f dist/terraform-provider-azsqlaccess_v* dist/terraform-provider-azsqlaccess_v*.exe
 
           for PLATFORM in linux_amd64 linux_arm64 windows_amd64; do
             OS="${PLATFORM%_*}"
@@ -92,7 +94,12 @@ jobs:
               EXT=".exe"
             fi
 
+            # Unique build output prevents architecture-specific builds from overwriting each other.
+            BUILD_BINARY="terraform-provider-${PROVIDER_NAME}_v${VERSION}_${OS}_${ARCH}${EXT}"
+
+            # Terraform expects this standard filename inside each archive.
             BINARY="terraform-provider-${PROVIDER_NAME}_v${VERSION}${EXT}"
+            PACKAGE="terraform-provider-${PROVIDER_NAME}_${VERSION}_${OS}_${ARCH}.zip"
 
             echo "Building ${OS}/${ARCH}..."
 
@@ -100,13 +107,60 @@ jobs:
               go build \
                 -trimpath \
                 -ldflags="-s -w" \
-                -o "dist/$BINARY" \
+                -o "dist/$BUILD_BINARY" \
                 .
 
-            file "dist/$BINARY"
+            echo "Checking build output:"
+            file "dist/$BUILD_BINARY"
+
+            if [[ "$OS" == "linux" ]]; then
+              file "dist/$BUILD_BINARY" | grep -q 'ELF 64-bit'
+            else
+              file "dist/$BUILD_BINARY" | grep -q 'PE32'
+            fi
+
+            echo "Packaging $PACKAGE"
+
+            STAGING_DIR="$(mktemp -d)"
+            cp "dist/$BUILD_BINARY" "$STAGING_DIR/$BINARY"
+
+            (
+              cd "$STAGING_DIR"
+              zip -q "$GITHUB_WORKSPACE/dist/$PACKAGE" "$BINARY"
+            )
+
+            rm -rf "$STAGING_DIR"
           done
 
-      - name: Package platforms and sign checksums
+          echo "Verifying package contents:"
+          for PLATFORM in linux_amd64 linux_arm64 windows_amd64; do
+            OS="${PLATFORM%_*}"
+            ARCH="${PLATFORM#*_}"
+            EXT=""
+
+            if [[ "$OS" == "windows" ]]; then
+              EXT=".exe"
+            fi
+
+            PACKAGE="dist/terraform-provider-${PROVIDER_NAME}_${VERSION}_${OS}_${ARCH}.zip"
+            BINARY="terraform-provider-${PROVIDER_NAME}_v${VERSION}${EXT}"
+
+            unzip -l "$PACKAGE"
+
+            EXTRACT_DIR="$(mktemp -d)"
+            unzip -q "$PACKAGE" -d "$EXTRACT_DIR"
+            file "$EXTRACT_DIR/$BINARY"
+
+            if [[ "$OS" == "linux" ]]; then
+              file "$EXTRACT_DIR/$BINARY" | grep -q 'ELF 64-bit'
+            else
+              file "$EXTRACT_DIR/$BINARY" | grep -q 'PE32'
+            fi
+
+            rm -rf "$EXTRACT_DIR"
+          done
+
+      - name: Package checksums and sign manifest
         shell: bash
         env:
           VERSION: ${{ steps.version.outputs.version }}
@@ -125,17 +179,7 @@ jobs:
           for PLATFORM in linux_amd64 linux_arm64 windows_amd64; do
             OS="${PLATFORM%_*}"
             ARCH="${PLATFORM#*_}"
-            EXT=""
-
-            if [[ "$OS" == "windows" ]]; then
-              EXT=".exe"
-            fi
-
-            BINARY="terraform-provider-${PROVIDER_NAME}_v${VERSION}${EXT}"
             PACKAGE="terraform-provider-${PROVIDER_NAME}_${VERSION}_${OS}_${ARCH}.zip"
-
-            echo "Packaging $PACKAGE"
-            zip "$PACKAGE" "$BINARY"
 
             sha256sum "$PACKAGE" >> SHA256SUMS
           done
